@@ -1,0 +1,30 @@
+{
+  "client_id": "client_XXX",
+  "client_name": "Client Name",
+  "branding": {
+    "logo_url": "",
+    "primary_color": "#1e3a8a",
+    "secondary_color": "#f3f4f6",
+    "company_name": "Client Name"
+  },
+  "sitemaps": [
+    {
+      "name": "Main Website",
+      "url": "https://example.com/sitemap.xml",
+      "enabled": true,
+      "max_pages": 500
+    },
+    {
+      "name": "Blog Content",
+      "url": "https://example.com/blog-sitemap.xml",
+      "enabled": true,
+      "max_pages": 200
+    }
+  ],
+  "settings": {
+    "check_frequency": "monthly",
+    "error_severity_threshold": "important",
+    "report_style": "detailed",
+    "notification_email": "client@example.com"
+  }
+}
