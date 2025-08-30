@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.local
+
+# Node / misc
+node_modules/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Artifacts
+dist/
+build/
+*.sqlite
+
+# Secrets (never commit)
+service_account.json
