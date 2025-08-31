@@ -5,70 +5,13 @@ on:
   repository_dispatch:
     types: [grammar-check]
 
-permissions:
-  contents: read
-
-concurrency:
-  group: grammar-check-${{ github.event.client_payload.client_id || 'manual' }}-${{ github.run_id }}
-  cancel-in-progress: false
-
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      CLIENT_ID:  ${{ github.event.client_payload.client_id }}
-      AUDIT_TYPE: ${{ github.event.client_payload.audit_type }}
-      TARGET_URL: ${{ github.event.client_payload.url }}
-      # Optional callback back to Apps Script to update your status doc
-      CALLBACK_URL: ${{ secrets.CALLBACK_URL }}     # e.g., your Google Apps Script endpoint
-      CALLBACK_KEY: ${{ secrets.CALLBACK_KEY }}     # if you enforce an API key
-
     steps:
       - name: Show payload
         run: |
-          echo "Client:      ${CLIENT_ID}"
-          echo "Audit type:  ${AUDIT_TYPE}"
-          echo "Target URL:  ${TARGET_URL}"
-          echo "Raw payload:"
-          echo '${{ toJson(github.event.client_payload) }}'
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # If you use Node, keep this. If you use Python instead, replace with setup-python.
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install deps if package.json exists
-        if: ${{ hashFiles('package.json') != '' }}
-        run: npm ci || npm i
-
-      # Replace this with your real script, for example npm run grammar:single
-      - name: Run grammar check
-        run: |
-          mkdir -p out
-          node -e "const fs=require('fs'); fs.writeFileSync('out/results.json', JSON.stringify({ok:true, client:process.env.CLIENT_ID, type:process.env.AUDIT_TYPE, url:process.env.TARGET_URL, ts:new Date().toISOString()}, null, 2));"
-      
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: grammar-results-${{ github.run_id }}
-          path: out/results.json
-
-      - name: Add run summary
-        run: |
-          echo "## Grammar check" >> $GITHUB_STEP_SUMMARY
-          echo "- Client: \`${CLIENT_ID}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Type: \`${AUDIT_TYPE}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- URL:  \`${TARGET_URL}\`" >> $GITHUB_STEP_SUMMARY
-
-      # Optional, call back to your Google Apps Script to mark status complete
-      - name: Callback to status doc
-        if: ${{ env.CALLBACK_URL != '' }}
-        run: |
-          curl -sS -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $CALLBACK_KEY" \
-            -d @out/results.json
+          echo "Event:  ${{ github.event_name }}"
+          echo "Type:   ${{ github.event.action || github.event.client_payload.audit_type }}"
+          echo "Client: ${{ github.event.client_payload.client_id }}"
+          echo "URL:    ${{ github.event.client_payload.url }}"
