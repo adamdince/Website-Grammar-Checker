@@ -1,23 +1,17 @@
-// scripts/grammar-check.js (CommonJS, no deps)
-// Minimal real grammar check via LanguageTool's public API.
-// Works with your current workflow (single URL per run).
-// Node 20 has global fetch; no packages needed.
-
+// scripts/grammar-check.js
 const fs = require('fs');
 const path = require('path');
 
 const TARGET_URL = process.env.TARGET_URL || '';
 const CLIENT_ID  = process.env.CLIENT_ID  || '';
 const AUDIT_TYPE = process.env.AUDIT_TYPE || 'single';
-
-const LT_ENDPOINT = 'https://api.languagetool.org/v2/check'; // public, rate-limited
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 async function fetchHtml(url) {
   const r = await fetch(url, { redirect: 'follow' });
   if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
   return await r.text();
 }
-
 function extractText(html) {
   return String(html)
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -27,95 +21,96 @@ function extractText(html) {
     .trim();
 }
 
-function chunk(str, max) {
-  const out = [];
-  for (let i = 0; i < str.length; i += max) out.push(str.slice(i, i + max));
-  return out;
-}
+async function proofreadWithOpenAI(text, url) {
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not set');
+  const MAX = 15000; // keep inputs modest; raise later if needed
+  const body = {
+    model: "gpt-4o-mini",
+    instructions:
+      "You are an expert copy editor. Find spelling/grammar/usage issues. " +
+      "Return ONLY JSON matching the schema; give concise replacements.",
+    input:
+      `URL: ${url}\n\n` +
+      `TEXT:\n${text.slice(0, MAX)}`,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "GrammarAudit",
+        schema: {
+          type: "object",
+          properties: {
+            suggestions: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  issue:       { type: "string" },
+                  original:    { type: "string" },
+                  suggestion:  { type: "string" },
+                  explanation: { type: "string" },
+                  severity:    { type: "string", enum: ["low","medium","high"] }
+                },
+                required: ["issue","original","suggestion","explanation","severity"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["suggestions"],
+          additionalProperties: false
+        }
+      }
+    }
+  };
 
-async function checkTextLT(text, lang = 'en-US') {
-  // LanguageTool free endpoint prefers ~10k chars or less
-  const parts = chunk(text, 9500);
-  const matches = [];
-  for (const p of parts) {
-    const form = new URLSearchParams();
-    form.set('text', p);
-    form.set('language', lang);
-    // Avoid hammering the public endpoint
-    const r = await fetch(LT_ENDPOINT, { method: 'POST', body: form });
-    if (!r.ok) throw new Error(`LanguageTool HTTP ${r.status}`);
-    const json = await r.json();
-    if (Array.isArray(json.matches)) matches.push(...json.matches);
-    await new Promise(res => setTimeout(res, 250)); // gentle pause
-  }
-  return matches;
-}
-
-function summarize(matches, fullText) {
-  const byRule = {};
-  for (const m of matches) {
-    const id = (m.rule && m.rule.id) || 'UNKNOWN';
-    byRule[id] = (byRule[id] || 0) + 1;
-  }
-  const top = Object.entries(byRule).sort((a,b)=>b[1]-a[1]).slice(0, 10)
-              .map(([id, c]) => ({ rule: id, count: c }));
-
-  const examples = matches.slice(0, 15).map(m => {
-    const off = m.offset || 0;
-    const len = m.length || 0;
-    const start = Math.max(0, off - 60);
-    const end = Math.min(fullText.length, off + len + 60);
-    const context = fullText.slice(start, end);
-    return {
-      rule: (m.rule && m.rule.id) || 'UNKNOWN',
-      message: m.message || '',
-      replacement: (m.replacements && m.replacements[0] && m.replacements[0].value) || '',
-      context
-    };
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
   });
+  if (!r.ok) throw new Error(`OpenAI HTTP ${r.status}`);
+  const j = await r.json();
 
-  return { total: matches.length, topRules: top, examples };
+  // Prefer Responses API's unified text helper if present; else fall back safely
+  const textOut = j.output_text || j.content?.[0]?.text || j.choices?.[0]?.message?.content || "";
+  try { return JSON.parse(textOut); } catch { throw new Error("OpenAI did not return valid JSON"); }
 }
 
 (async () => {
   const outDir = path.join('out');
   fs.mkdirSync(outDir, { recursive: true });
-
-  let ok = true, error = '', result = {};
   const t0 = Date.now();
+  let result;
 
   try {
-    if (!/^https?:\/\//i.test(TARGET_URL)) throw new Error('Missing or invalid TARGET_URL');
     const html = await fetchHtml(TARGET_URL);
     const text = extractText(html);
-    const matches = await checkTextLT(text, 'en-US');
-    const summary = summarize(matches, text);
+    const ai   = await proofreadWithOpenAI(text, TARGET_URL);
 
     result = {
       ok: true,
       client_id: CLIENT_ID,
       audit_type: AUDIT_TYPE,
       url: TARGET_URL,
-      total_issues: summary.total,
-      top_rules: summary.topRules,      // [{rule,count}, …]
-      examples: summary.examples,       // up to 15 with context
+      total_suggestions: Array.isArray(ai.suggestions) ? ai.suggestions.length : 0,
+      suggestions: ai.suggestions || [],
       sample: text.slice(0, 300),
       duration_ms: Date.now() - t0
     };
   } catch (e) {
-    ok = false;
-    error = String(e && e.message || e);
     result = {
-      ok,
+      ok: false,
       client_id: CLIENT_ID,
       audit_type: AUDIT_TYPE,
       url: TARGET_URL,
-      error,
+      error: String(e && e.message || e),
       duration_ms: Date.now() - t0
     };
+    process.exitCode = 1;
   }
 
   fs.writeFileSync(path.join(outDir, 'results.json'), JSON.stringify(result, null, 2));
   console.log('Wrote out/results.json');
-  if (!ok) process.exitCode = 1;
 })();
