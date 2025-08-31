@@ -134,22 +134,26 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
-      # ---- OPTIONAL Google Doc callback; follows Apps Script 302 redirect ----
+      # ---- OPTIONAL Google Doc callback via GET (follows /exec redirect) ----
       - name: Post summary to Google Doc (optional)
         env:
-          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
-          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
-          SRC_URL: ${{ env.SRC_URL }}
-          CLIENT_ID: ${{ env.CLIENT_ID }}
-          COUNT: ${{ env.COUNT }}
+          URL_SECRET: ${{ secrets.DOC_CALLBACK_URL }}
+          KEY_SECRET: ${{ secrets.DOC_CALLBACK_KEY }}
+          URL_VAR:    ${{ vars.DOC_CALLBACK_URL }}
+          KEY_VAR:    ${{ vars.DOC_CALLBACK_KEY }}
+          SRC_URL:    ${{ env.SRC_URL }}
+          CLIENT_ID:  ${{ env.CLIENT_ID }}
+          COUNT:      ${{ env.COUNT }}
         run: |
           set -euo pipefail
+          DOC_CALLBACK_URL="${URL_SECRET:-${URL_VAR:-}}"
+          DOC_CALLBACK_KEY="${KEY_SECRET:-${KEY_VAR:-}}"
+
           if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
-            echo "Doc callback secrets not set; skipping."
+            echo "Doc callback not configured in Secrets or Variables; skipping."
             exit 0
           fi
-      
-          # Use GET + query params; follow 302 automatically
+
           HTTP=$(curl -sS -L -G -o /tmp/doc_cb.out -w "%{http_code}" \
             "$DOC_CALLBACK_URL" \
             --data-urlencode "api_key=${DOC_CALLBACK_KEY}" \
@@ -157,7 +161,7 @@ jobs:
             --data-urlencode "client_id=${CLIENT_ID:-}" \
             --data-urlencode "audit_type=single" \
             --data-urlencode "total=${COUNT:-0}")
-      
+
           echo "Callback HTTP: $HTTP"
           if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
             echo "::error::Doc callback failed (HTTP $HTTP). Response:"
@@ -165,5 +169,16 @@ jobs:
             exit 1
           fi
 
-    echo "Doc callback OK:"
-    sed -n '1,200p' /tmp/doc_cb.out
+          echo "Doc callback OK:"
+          sed -n '1,200p' /tmp/doc_cb.out
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grammar-report
+          path: |
+            doc_full.txt
+            chunks/**
+            reports/**
+            matches_all.json
+            report.md
