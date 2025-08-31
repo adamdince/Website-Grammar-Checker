@@ -38,3 +38,4 @@ jobs:
             -H "Content-Type: application/json" \
             -H "x-api-key: $CALLBACK_KEY" \
             --data-binary @out/results.json
+
