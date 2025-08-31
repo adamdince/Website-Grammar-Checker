@@ -1,0 +1,17 @@
+name: Grammar Check
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [grammar-check]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show event
+        run: |
+          echo "Triggered by ${{ github.event_name }}"
+          echo "Event type: ${{ github.event.action || github.event.client_payload.event_type }}"
+          echo "Client payload:"
+          echo '${{ toJson(github.event.client_payload) }}'
