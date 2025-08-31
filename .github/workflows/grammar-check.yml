@@ -135,27 +135,25 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
-      # ---- Send ALL findings to Google Doc (expects your doPost to call appendReportToDoc_) ----
+      # ---- Send ALL findings to Google Doc via POST (requires doPost in your Web App) ----
       - name: Post ALL findings to Google Doc (optional)
         env:
-          URL_SECRET: ${{ secrets.DOC_CALLBACK_URL }}
-          KEY_SECRET: ${{ secrets.DOC_CALLBACK_KEY }}
-          URL_VAR:    ${{ vars.DOC_CALLBACK_URL }}
-          KEY_VAR:    ${{ vars.DOC_CALLBACK_KEY }}
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # must be your Web App /exec URL
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # must match IMPORT_API_KEY in Apps Script
           SRC_URL:    ${{ env.SRC_URL }}
           CLIENT_ID:  ${{ env.CLIENT_ID }}
           COUNT:      ${{ env.COUNT }}
         run: |
           set -euo pipefail
-          DOC_CALLBACK_URL="${URL_SECRET:-${URL_VAR:-}}"
-          DOC_CALLBACK_KEY="${KEY_SECRET:-${KEY_VAR:-}}"
+
+          echo "Using callback endpoint: ${DOC_CALLBACK_URL:-<unset>}"
 
           if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
-            echo "Doc callback not configured in Secrets or Variables; skipping."
+            echo "Doc callback secrets not set; skipping."
             exit 0
           fi
 
-          # Build a compact-but-complete matches array (ALL items)
+          # Build ALL matches (compact, but includes every finding)
           jq '[ .[] | {
                 rule:(.rule.issueType // .rule.category.id // .rule.id),
                 message:.message,
