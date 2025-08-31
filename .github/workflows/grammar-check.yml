@@ -1,13 +1,17 @@
 name: Grammar Check
 on:
   repository_dispatch:
-    types: [grammar-check]   # supports Apps Script dispatches
-  workflow_dispatch:          # lets you run from the Actions UI too
+    types: [grammar-check]   # for Apps Script button
+  workflow_dispatch:          # still lets you run from the Actions UI
     inputs:
       text:
         description: "Paste any text to check"
         required: false
         type: string
+
+permissions:
+  contents: read
+  issues: write   # we will post results as a GitHub Issue
 
 jobs:
   run:
@@ -15,36 +19,84 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure jq
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Extract text -> doc.txt
+      - name: Extract payload -> files and env
         run: |
-          # Prefer text from repository_dispatch payload; else use UI input
+          # Prefer repository_dispatch payload; else UI input
           TEXT=$(jq -r '.client_payload.text // empty' "$GITHUB_EVENT_PATH")
+          DOC_ID=$(jq -r '.client_payload.docId // empty' "$GITHUB_EVENT_PATH")
+          DOC_NAME=$(jq -r '.client_payload.docName // empty' "$GITHUB_EVENT_PATH")
+          DOC_URL=$(jq -r '.client_payload.docUrl // empty' "$GITHUB_EVENT_PATH")
+
           if [ -z "$TEXT" ]; then TEXT="${{ github.event.inputs.text }}"; fi
           printf "%s" "$TEXT" > doc.txt
-          if [ ! -s doc.txt ]; then
-            echo "No text provided via payload or UI input"; exit 1
-          fi
-          echo "Bytes: $(wc -c < doc.txt)"
 
-      - name: Grammar check via LanguageTool (public API)
+          echo "DOC_ID=$DOC_ID"     >> $GITHUB_ENV
+          echo "DOC_NAME=$DOC_NAME" >> $GITHUB_ENV
+          echo "DOC_URL=$DOC_URL"   >> $GITHUB_ENV
+          echo "BYTE_SIZE=$(wc -c < doc.txt)" >> $GITHUB_ENV
+
+          if [ ! -s doc.txt ]; then
+            echo "::error::No text provided via payload or UI input"; exit 1
+          fi
+          echo "Saved doc.txt (${BYTE_SIZE} bytes)"
+
+      - name: Run LanguageTool (public API)
+        id: lt
         run: |
-          RESP=$(curl -sS -X POST https://api.languagetool.org/v2/check \
+          set -euo pipefail
+          curl -sS -X POST https://api.languagetool.org/v2/check \
             -H 'Content-Type: application/x-www-form-urlencoded' \
             -d 'language=en-US' \
-            --data-urlencode text@doc.txt)
+            --data-urlencode text@doc.txt > report.json
 
-          echo "$RESP" | jq '.matches | length as $n | "Found \($n) issues"'
-          echo
-          echo "Top issues:"
-          echo "$RESP" | jq -r '.matches[] |
-            (.rule.issueType + ": " + .message + " | context: \"" + .context.text + "\"")' \
-            | head -n 25
+          COUNT=$(jq '.matches | length' report.json)
+          echo "COUNT=$COUNT" >> $GITHUB_ENV
+          echo "Found $COUNT issues"
 
-          # Optional: fail only if lots of issues
-          COUNT=$(echo "$RESP" | jq '.matches | length')
-          if [ "$COUNT" -gt 100 ]; then
-            echo "::error::Too many issues ($COUNT)"; exit 1
-          fi
+      - name: Build Markdown report
+        run: |
+          {
+            echo "# Grammar Report"
+            echo
+            echo "**Document:** ${DOC_NAME:-Untitled}  "
+            if [ -n "${DOC_URL}" ]; then echo "**URL:** ${DOC_URL}  "; fi
+            echo "**Bytes scanned:** ${BYTE_SIZE}  "
+            echo "**Issues found:** ${COUNT}"
+            echo
+            echo "## Top findings"
+            jq -r '
+              .matches[0:50][] |
+              "- **\(.rule.issueType // .rule.category.id // .rule.id)**: \(.message)
+                 - Context: \"\(.context.text)\"
+                 - Suggestion: \((.replacements[0].value // "—"))"
+            ' report.json
+          } > report.md
+          echo "Report written to report.md"
+
+      - name: Create issue with report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const titleBase = process.env.DOC_NAME || 'Grammar report';
+            const title = `${titleBase} – ${new Date().toISOString().slice(0,19)}Z`;
+            const body  = fs.readFileSync('report.md','utf8');
+            const labels = ['grammar-report'];
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title, body, labels
+            });
+            core.info(`Created issue #${issue.number}`);
+
+      - name: Upload raw artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grammar-report
+          path: |
+            doc.txt
+            report.json
+            report.md
