@@ -92,7 +92,8 @@ jobs:
             fi
             sleep 1  # gentle throttle for the public API
           done
-          # Aggregate all matches from all chunks into a single array
+
+          # Aggregate all matches across chunks
           jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
           COUNT=$(jq 'length' matches_all.json)
           echo "COUNT=$COUNT" >> $GITHUB_ENV
@@ -134,8 +135,8 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
-      # ---- OPTIONAL Google Doc callback via GET (follows /exec redirect) ----
-      - name: Post summary to Google Doc (optional)
+      # ---- Send ALL findings to Google Doc (expects your doPost to call appendReportToDoc_) ----
+      - name: Post ALL findings to Google Doc (optional)
         env:
           URL_SECRET: ${{ secrets.DOC_CALLBACK_URL }}
           KEY_SECRET: ${{ secrets.DOC_CALLBACK_KEY }}
@@ -154,23 +155,36 @@ jobs:
             exit 0
           fi
 
-          HTTP=$(curl -sS -L -G -o /tmp/doc_cb.out -w "%{http_code}" \
-            "$DOC_CALLBACK_URL" \
-            --data-urlencode "api_key=${DOC_CALLBACK_KEY}" \
-            --data-urlencode "url=${SRC_URL:-}" \
-            --data-urlencode "client_id=${CLIENT_ID:-}" \
-            --data-urlencode "audit_type=single" \
-            --data-urlencode "total=${COUNT:-0}")
+          # Build a compact-but-complete matches array (ALL items)
+          jq '[ .[] | {
+                rule:(.rule.issueType // .rule.category.id // .rule.id),
+                message:.message,
+                context:(.context.text),
+                suggestion:(.replacements[0].value // null)
+              } ]' matches_all.json > matches_compact.json
 
-          echo "Callback HTTP: $HTTP"
+          # Build payload with ALL matches
+          jq -n --arg url "${SRC_URL:-}" --arg client_id "${CLIENT_ID:-}" \
+                --arg audit_type "single" --argjson total "${COUNT:-0}" \
+                --slurpfile matches matches_compact.json \
+                '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
+              > detail_payload.json
+
+          # POST (follow /exec -> googleusercontent redirect and keep POST)
+          HTTP=$(curl -sS -L --post301 --post302 --post303 -o /tmp/doc_cb_detail.out -w "%{http_code}" \
+            -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: $DOC_CALLBACK_KEY" \
+            --data-binary @detail_payload.json)
+
+          echo "Detail callback HTTP: $HTTP"
           if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
-            echo "::error::Doc callback failed (HTTP $HTTP). Response:"
-            sed -n '1,200p' /tmp/doc_cb.out
+            echo "::error::Detail Doc callback failed (HTTP $HTTP). Response:"
+            sed -n '1,200p' /tmp/doc_cb_detail.out
             exit 1
           fi
-
-          echo "Doc callback OK:"
-          sed -n '1,200p' /tmp/doc_cb.out
+          echo "Detail Doc callback OK:"
+          sed -n '1,200p' /tmp/doc_cb_detail.out
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -181,4 +195,6 @@ jobs:
             chunks/**
             reports/**
             matches_all.json
+            matches_compact.json
+            detail_payload.json
             report.md
