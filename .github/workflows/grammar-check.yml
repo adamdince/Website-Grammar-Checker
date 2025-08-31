@@ -33,7 +33,8 @@ jobs:
       - name: Send results to Google Doc
         if: ${{ env.CALLBACK_URL != '' }}
         run: |
-          curl -sS -X POST "$CALLBACK_URL" \
+          curl -sS -L --post301 --post302 --fail-with-body \
+            -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -H "x-api-key: $CALLBACK_KEY" \
             --data-binary @out/results.json
