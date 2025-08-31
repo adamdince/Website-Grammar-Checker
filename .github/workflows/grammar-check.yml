@@ -1,11 +1,16 @@
-name: Grammar Check
+name: Website Grammar Check
+
 on:
   repository_dispatch:
     types: [grammar-check]
   workflow_dispatch:
     inputs:
+      url:
+        description: "URL to check (optional if payload supplies it)"
+        required: false
+        type: string
       text:
-        description: "Paste any text to check"
+        description: "Raw text to check (optional)"
         required: false
         type: string
 
@@ -16,6 +21,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,55 +30,92 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq lynx
 
-      - name: Extract payload and build doc.txt
+      - name: Extract payload and build FULL text
         id: build
         run: |
+          set -euo pipefail
           URL=$(jq -r '.client_payload.url // empty' "$GITHUB_EVENT_PATH")
           TEXT=$(jq -r '.client_payload.text // empty' "$GITHUB_EVENT_PATH")
           CID=$(jq -r '.client_payload.client_id // empty' "$GITHUB_EVENT_PATH")
-          echo "CLIENT_ID=$CID" >> $GITHUB_ENV
-          echo "SRC_URL=$URL"   >> $GITHUB_ENV
+          # allow manual run inputs too
+          if [ -z "$URL" ];  then URL="${{ github.event.inputs.url }}";  fi
+          if [ -z "$TEXT" ]; then TEXT="${{ github.event.inputs.text }}"; fi
+
+          echo "SRC_URL=$URL"     >> $GITHUB_ENV
+          echo "CLIENT_ID=$CID"   >> $GITHUB_ENV
 
           if [ -n "$URL" ]; then
             echo "Fetching $URL"
-            curl -fsSL "$URL" -o page.html
-            # Convert HTML to plain text (simple + robust)
-            lynx -dump -nolist page.html > doc.txt
+            curl -fsSL -H "User-Agent: Mozilla/5.0" "$URL" -o page.html
+            lynx -dump -nolist page.html > doc_full.txt
           else
-            if [ -z "$TEXT" ]; then TEXT="${{ github.event.inputs.text }}"; fi
-            printf "%s" "$TEXT" > doc.txt
+            printf "%s" "$TEXT" > doc_full.txt
           fi
 
-          if [ ! -s doc.txt ]; then
-            echo "::error::No content to analyze (neither url nor text)"; exit 1
+          if [ ! -s doc_full.txt ]; then
+            echo "::error::No content to analyze (neither URL nor text)"; exit 1
           fi
-          echo "BYTE_SIZE=$(wc -c < doc.txt)" >> $GITHUB_ENV
-          echo "Built doc.txt"
 
-      - name: Run LanguageTool
+          BYTES=$(wc -c < doc_full.txt)
+          echo "FULL_BYTES=$BYTES" >> $GITHUB_ENV
+          echo "Built doc_full.txt ($BYTES bytes)"
+
+      - name: Chunk long text (~15 KB per chunk)
         run: |
-          curl -sS -X POST https://api.languagetool.org/v2/check \
-            -H 'Content-Type: application/x-www-form-urlencoded' \
-            -d 'language=en-US' \
-            --data-urlencode text@doc.txt > report.json
-          echo "COUNT=$(jq '.matches | length' report.json)" >> $GITHUB_ENV
+          set -euo pipefail
+          rm -rf chunks reports
+          mkdir -p chunks reports
+          # Split by bytes for robustness; 15000 stays within LT public limits
+          split -b 15000 -d -a 3 doc_full.txt chunks/chunk_
+          COUNT=$(ls chunks | wc -l | tr -d ' ')
+          echo "CHUNK_COUNT=$COUNT" >> $GITHUB_ENV
+          echo "Created $COUNT chunk(s)"
+
+      - name: Run LanguageTool on all chunks
+        run: |
+          set -euo pipefail
+          for f in $(ls chunks | sort); do
+            fp="chunks/$f"
+            echo "Checking $fp"
+            HTTP=$(curl -sS -o "reports/$f.json" -w "%{http_code}" \
+              -X POST https://api.languagetool.org/v2/check \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              -d 'language=en-US' \
+              --data-urlencode text@"$fp")
+            if [ "$HTTP" -ne 200 ]; then
+              echo "::warning::LanguageTool returned $HTTP for $fp (using empty matches)"
+              echo '{"matches":[]}' > "reports/$f.json"
+            else
+              if ! jq -e . "reports/$f.json" >/dev/null 2>&1; then
+                echo "::warning::Non-JSON from LanguageTool for $fp (using empty matches)"
+                echo '{"matches":[]}' > "reports/$f.json"
+              fi
+            fi
+            sleep 1  # gentle throttle for the public API
+          done
+          # Aggregate all matches from all chunks into a single array
+          jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
+          COUNT=$(jq 'length' matches_all.json)
+          echo "COUNT=$COUNT" >> $GITHUB_ENV
+          echo "Aggregated $COUNT match(es)"
 
       - name: Build Markdown report
         run: |
           {
             echo "# Grammar Report"
-            if [ -n "${SRC_URL}" ]; then echo "**URL:** ${SRC_URL}  "; fi
+            if [ -n "${SRC_URL}"   ]; then echo "**URL:** ${SRC_URL}  "; fi
             if [ -n "${CLIENT_ID}" ]; then echo "**Client ID:** ${CLIENT_ID}  "; fi
-            echo "**Bytes scanned:** ${BYTE_SIZE}  "
+            echo "**Bytes scanned (full):** ${FULL_BYTES}  "
+            echo "**Chunks:** ${CHUNK_COUNT}  "
             echo "**Issues found:** ${COUNT}"
             echo
             echo "## Top findings"
             jq -r '
-              .matches[0:50][] |
+              .[0:100][] |
               "- **\(.rule.issueType // .rule.category.id // .rule.id)**: \(.message)
                  - Context: \"\(.context.text)\"
                  - Suggestion: \((.replacements[0].value // "—"))"
-            ' report.json
+            ' matches_all.json
           } > report.md
           echo "Report written to report.md"
 
@@ -92,11 +135,32 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
+      - name: (Optional) Post summary to Google Doc
+        if: ${{ secrets.DOC_CALLBACK_URL != '' && secrets.DOC_CALLBACK_KEY != '' }}
+        env:
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
+          SRC_URL: ${{ env.SRC_URL }}
+          CLIENT_ID: ${{ env.CLIENT_ID }}
+          COUNT: ${{ env.COUNT }}
+        run: |
+          set -euo pipefail
+          jq -n --arg url "$SRC_URL" --arg client_id "$CLIENT_ID" \
+                --arg audit_type "single" --argjson total "$COUNT" \
+                '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total}' \
+              > doc_payload.json
+          curl -fsS -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: $DOC_CALLBACK_KEY" \
+            --data-binary @doc_payload.json
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: grammar-report
           path: |
-            doc.txt
-            report.json
+            doc_full.txt
+            chunks/**
+            reports/**
+            matches_all.json
             report.md
