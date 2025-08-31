@@ -1,0 +1,19 @@
+name: Grammar Smoke Test
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: "Paste any text to test"
+        required: true
+        type: string
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save text to doc.txt
+        run: printf "%s" "${{ github.event.inputs.text }}" > doc.txt
+      - name: Show bytes and first lines
+        run: |
+          echo "Bytes:" $(wc -c < doc.txt)
+          head -n 5 doc.txt || true
