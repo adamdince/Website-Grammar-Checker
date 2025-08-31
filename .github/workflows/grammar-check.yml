@@ -137,7 +137,6 @@ jobs:
       # ---- OPTIONAL Google Doc callback; follows Apps Script 302 redirect ----
       - name: Post summary to Google Doc (optional)
         env:
-          # Prefer Secrets; if you put them under Variables, add a fallback (see below)
           DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
           DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
           SRC_URL: ${{ env.SRC_URL }}
@@ -149,19 +148,16 @@ jobs:
             echo "Doc callback secrets not set; skipping."
             exit 0
           fi
-
-          jq -n --arg url "${SRC_URL:-}" --arg client_id "${CLIENT_ID:-}" \
-                --arg audit_type "single" --argjson total "${COUNT:-0}" \
-                '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total}' \
-              > doc_payload.json
-
-          # Follow /exec -> googleusercontent 302 and keep POST on redirect
-          HTTP=$(curl -sS -L --post301 --post302 --post303 -o /tmp/doc_cb.out -w "%{http_code}" \
-            -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
-            -H 'Content-Type: application/json' \
-            -H "x-api-key: $DOC_CALLBACK_KEY" \
-            --data-binary @doc_payload.json)
-
+      
+          # Use GET + query params; follow 302 automatically
+          HTTP=$(curl -sS -L -G -o /tmp/doc_cb.out -w "%{http_code}" \
+            "$DOC_CALLBACK_URL" \
+            --data-urlencode "api_key=${DOC_CALLBACK_KEY}" \
+            --data-urlencode "url=${SRC_URL:-}" \
+            --data-urlencode "client_id=${CLIENT_ID:-}" \
+            --data-urlencode "audit_type=single" \
+            --data-urlencode "total=${COUNT:-0}")
+      
           echo "Callback HTTP: $HTTP"
           if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
             echo "::error::Doc callback failed (HTTP $HTTP). Response:"
@@ -169,16 +165,5 @@ jobs:
             exit 1
           fi
 
-          echo "Doc callback OK:"
-          sed -n '1,200p' /tmp/doc_cb.out
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: grammar-report
-          path: |
-            doc_full.txt
-            chunks/**
-            reports/**
-            matches_all.json
-            report.md
+    echo "Doc callback OK:"
+    sed -n '1,200p' /tmp/doc_cb.out
