@@ -21,7 +21,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -41,8 +40,8 @@ jobs:
           if [ -z "$URL" ];  then URL="${{ github.event.inputs.url }}";  fi
           if [ -z "$TEXT" ]; then TEXT="${{ github.event.inputs.text }}"; fi
 
-          echo "SRC_URL=$URL"     >> $GITHUB_ENV
-          echo "CLIENT_ID=$CID"   >> $GITHUB_ENV
+          echo "SRC_URL=$URL"   >> $GITHUB_ENV
+          echo "CLIENT_ID=$CID" >> $GITHUB_ENV
 
           if [ -n "$URL" ]; then
             echo "Fetching $URL"
@@ -135,30 +134,26 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
+      # ---- OPTIONAL Google Doc callback; guard INSIDE the step ----
       - name: Post summary to Google Doc (optional)
-  env:
-    DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
-    DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
-    SRC_URL: ${{ env.SRC_URL }}
-    CLIENT_ID: ${{ env.CLIENT_ID }}
-    COUNT: ${{ env.COUNT }}
-  run: |
-    set -euo pipefail
-    if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
-      echo "Doc callback secrets not set; skipping."
-      exit 0
-    fi
-
-    jq -n --arg url "$SRC_URL" --arg client_id "$CLIENT_ID" \
-          --arg audit_type "single" --argjson total "$COUNT" \
-          '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total}' \
-        > doc_payload.json
-
-    curl -fsS -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
-      -H 'Content-Type: application/json' \
-      -H "x-api-key: $DOC_CALLBACK_KEY" \
-      --data-binary @doc_payload.json
-
+        env:
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
+            echo "Doc callback secrets not set; skipping."
+            exit 0
+          fi
+          # SRC_URL, CLIENT_ID, COUNT come from $GITHUB_ENV earlier
+          jq -n --arg url "${SRC_URL:-}" --arg client_id "${CLIENT_ID:-}" \
+                --arg audit_type "single" --argjson total "${COUNT:-0}" \
+                '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total}' \
+            > doc_payload.json
+          curl -fsS -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: $DOC_CALLBACK_KEY" \
+            --data-binary @doc_payload.json
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
