@@ -1,41 +1,33 @@
+# .github/workflows/grammar-check.yml
 name: Grammar Check
-
 on:
-  workflow_dispatch:
   repository_dispatch:
     types: [grammar-check]
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      CLIENT_ID:        ${{ github.event.client_payload.client_id }}
-      AUDIT_TYPE:       ${{ github.event.client_payload.audit_type }}
-      TARGET_URL:       ${{ github.event.client_payload.url }}
-      OPENAI_API_KEY:   ${{ secrets.OPENAI_API_KEY }}   # optional; only used if you enabled OpenAI
-      CALLBACK_URL:     ${{ secrets.CALLBACK_URL }}     # <-- add this secret
-      CALLBACK_KEY:     ${{ secrets.CALLBACK_KEY }}     # <-- add this secret
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
 
-      - name: Run checker
-        run: node scripts/grammar-check.js
+      - name: Ensure jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Upload results (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-${{ github.run_id }}
-          path: out/results.json
-
-      - name: Send results to Google Doc
-        if: ${{ env.CALLBACK_URL != '' }}
+      - name: Extract pushed text to doc.txt
         run: |
-          curl -sS -L --post301 --post302 --fail-with-body \
-            -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $CALLBACK_KEY" \
-            --data-binary @out/results.json
+          jq -r '.client_payload.text // empty' "$GITHUB_EVENT_PATH" > doc.txt
+          if [ ! -s doc.txt ]; then
+            echo "No text found in client_payload.text"
+            echo "Payload was:"; cat "$GITHUB_EVENT_PATH"
+            exit 1
+          fi
+          # Guard: fail fast if we accidentally got an HTML error page
+          if head -c 20 doc.txt | grep -qi '<html'; then
+            echo "Received HTML instead of text, aborting."; exit 1
+          fi
+          echo "Wrote $(wc -c < doc.txt) bytes to doc.txt"
 
+      # 👉 run your grammar checker against doc.txt here
+      - name: Run grammar check
+        run: |
+          ./scripts/run_grammar_check.sh doc.txt
