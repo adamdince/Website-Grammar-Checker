@@ -1,8 +1,13 @@
-# .github/workflows/grammar-check.yml
 name: Grammar Check
 on:
   repository_dispatch:
-    types: [grammar-check]
+    types: [grammar-check]   # supports Apps Script dispatches
+  workflow_dispatch:          # lets you run from the Actions UI too
+    inputs:
+      text:
+        description: "Paste any text to check"
+        required: false
+        type: string
 
 jobs:
   run:
@@ -13,21 +18,33 @@ jobs:
       - name: Ensure jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Extract pushed text to doc.txt
+      - name: Extract text -> doc.txt
         run: |
-          jq -r '.client_payload.text // empty' "$GITHUB_EVENT_PATH" > doc.txt
+          # Prefer text from repository_dispatch payload; else use UI input
+          TEXT=$(jq -r '.client_payload.text // empty' "$GITHUB_EVENT_PATH")
+          if [ -z "$TEXT" ]; then TEXT="${{ github.event.inputs.text }}"; fi
+          printf "%s" "$TEXT" > doc.txt
           if [ ! -s doc.txt ]; then
-            echo "No text found in client_payload.text"
-            echo "Payload was:"; cat "$GITHUB_EVENT_PATH"
-            exit 1
+            echo "No text provided via payload or UI input"; exit 1
           fi
-          # Guard: fail fast if we accidentally got an HTML error page
-          if head -c 20 doc.txt | grep -qi '<html'; then
-            echo "Received HTML instead of text, aborting."; exit 1
-          fi
-          echo "Wrote $(wc -c < doc.txt) bytes to doc.txt"
+          echo "Bytes: $(wc -c < doc.txt)"
 
-      # 👉 run your grammar checker against doc.txt here
-      - name: Run grammar check
+      - name: Grammar check via LanguageTool (public API)
         run: |
-          ./scripts/run_grammar_check.sh doc.txt
+          RESP=$(curl -sS -X POST https://api.languagetool.org/v2/check \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d 'language=en-US' \
+            --data-urlencode text@doc.txt)
+
+          echo "$RESP" | jq '.matches | length as $n | "Found \($n) issues"'
+          echo
+          echo "Top issues:"
+          echo "$RESP" | jq -r '.matches[] |
+            (.rule.issueType + ": " + .message + " | context: \"" + .context.text + "\"")' \
+            | head -n 25
+
+          # Optional: fail only if lots of issues
+          COUNT=$(echo "$RESP" | jq '.matches | length')
+          if [ "$COUNT" -gt 100 ]; then
+            echo "::error::Too many issues ($COUNT)"; exit 1
+          fi
