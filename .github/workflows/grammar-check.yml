@@ -1,25 +1,121 @@
-name: Grammar Check
-on:
-  workflow_dispatch:
-  repository_dispatch:
-    types: [grammar-check]
+// scripts/grammar-check.js (CommonJS, no deps)
+// Minimal real grammar check via LanguageTool's public API.
+// Works with your current workflow (single URL per run).
+// Node 20 has global fetch; no packages needed.
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    env:
-      CLIENT_ID:  ${{ github.event.client_payload.client_id }}
-      AUDIT_TYPE: ${{ github.event.client_payload.audit_type }}
-      TARGET_URL: ${{ github.event.client_payload.url }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - name: Run checker
-        run: |
-          node scripts/grammar-check.js
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-${{ github.run_id }}
-          path: out/results.json
+const fs = require('fs');
+const path = require('path');
+
+const TARGET_URL = process.env.TARGET_URL || '';
+const CLIENT_ID  = process.env.CLIENT_ID  || '';
+const AUDIT_TYPE = process.env.AUDIT_TYPE || 'single';
+
+const LT_ENDPOINT = 'https://api.languagetool.org/v2/check'; // public, rate-limited
+
+async function fetchHtml(url) {
+  const r = await fetch(url, { redirect: 'follow' });
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  return await r.text();
+}
+
+function extractText(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function chunk(str, max) {
+  const out = [];
+  for (let i = 0; i < str.length; i += max) out.push(str.slice(i, i + max));
+  return out;
+}
+
+async function checkTextLT(text, lang = 'en-US') {
+  // LanguageTool free endpoint prefers ~10k chars or less
+  const parts = chunk(text, 9500);
+  const matches = [];
+  for (const p of parts) {
+    const form = new URLSearchParams();
+    form.set('text', p);
+    form.set('language', lang);
+    // Avoid hammering the public endpoint
+    const r = await fetch(LT_ENDPOINT, { method: 'POST', body: form });
+    if (!r.ok) throw new Error(`LanguageTool HTTP ${r.status}`);
+    const json = await r.json();
+    if (Array.isArray(json.matches)) matches.push(...json.matches);
+    await new Promise(res => setTimeout(res, 250)); // gentle pause
+  }
+  return matches;
+}
+
+function summarize(matches, fullText) {
+  const byRule = {};
+  for (const m of matches) {
+    const id = (m.rule && m.rule.id) || 'UNKNOWN';
+    byRule[id] = (byRule[id] || 0) + 1;
+  }
+  const top = Object.entries(byRule).sort((a,b)=>b[1]-a[1]).slice(0, 10)
+              .map(([id, c]) => ({ rule: id, count: c }));
+
+  const examples = matches.slice(0, 15).map(m => {
+    const off = m.offset || 0;
+    const len = m.length || 0;
+    const start = Math.max(0, off - 60);
+    const end = Math.min(fullText.length, off + len + 60);
+    const context = fullText.slice(start, end);
+    return {
+      rule: (m.rule && m.rule.id) || 'UNKNOWN',
+      message: m.message || '',
+      replacement: (m.replacements && m.replacements[0] && m.replacements[0].value) || '',
+      context
+    };
+  });
+
+  return { total: matches.length, topRules: top, examples };
+}
+
+(async () => {
+  const outDir = path.join('out');
+  fs.mkdirSync(outDir, { recursive: true });
+
+  let ok = true, error = '', result = {};
+  const t0 = Date.now();
+
+  try {
+    if (!/^https?:\/\//i.test(TARGET_URL)) throw new Error('Missing or invalid TARGET_URL');
+    const html = await fetchHtml(TARGET_URL);
+    const text = extractText(html);
+    const matches = await checkTextLT(text, 'en-US');
+    const summary = summarize(matches, text);
+
+    result = {
+      ok: true,
+      client_id: CLIENT_ID,
+      audit_type: AUDIT_TYPE,
+      url: TARGET_URL,
+      total_issues: summary.total,
+      top_rules: summary.topRules,      // [{rule,count}, …]
+      examples: summary.examples,       // up to 15 with context
+      sample: text.slice(0, 300),
+      duration_ms: Date.now() - t0
+    };
+  } catch (e) {
+    ok = false;
+    error = String(e && e.message || e);
+    result = {
+      ok,
+      client_id: CLIENT_ID,
+      audit_type: AUDIT_TYPE,
+      url: TARGET_URL,
+      error,
+      duration_ms: Date.now() - t0
+    };
+  }
+
+  fs.writeFileSync(path.join(outDir, 'results.json'), JSON.stringify(result, null, 2));
+  console.log('Wrote out/results.json');
+  if (!ok) process.exitCode = 1;
+})();
