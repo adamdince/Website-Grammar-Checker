@@ -99,4 +99,134 @@ jobs:
               }' "$fp" > req.json
 
               curl -sS -o out.json -w "%{http_code}" \
-                -X POST https://api.openai.com/v1/cha
+                -X POST https://api.openai.com/v1/chat/completions \
+                -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+                -H "Content-Type: application/json" \
+                --data-binary @req.json
+            }
+
+            HTTP=$(try_model "$PRIMARY_MODEL")
+            if [ "$HTTP" -ne 200 ]; then
+              # Peek at the error to decide whether to fallback
+              ERR_MSG=$(jq -r '.error.message // empty' out.json 2>/dev/null || true)
+              ERR_TYPE=$(jq -r '.error.type // empty' out.json 2>/dev/null || true)
+              echo "::warning::OpenAI $HTTP for $fp using $PRIMARY_MODEL ($ERR_TYPE) $ERR_MSG"
+
+              if echo "$ERR_MSG$ERR_TYPE" | grep -qiE 'model|not.?found|does.?not.?exist|unsupported|deprecate'; then
+                echo "Retrying $fp with fallback model: $FALLBACK_MODEL"
+                HTTP=$(try_model "$FALLBACK_MODEL")
+              fi
+            fi
+
+            if [ "$HTTP" -ne 200 ]; then
+              echo "::warning::OpenAI returned $HTTP for $fp after fallback; using empty matches"
+              echo '{"matches":[]}' > "reports/$f.json"
+              continue
+            fi
+
+            # Pull assistant content into reports/$f.json, strip fences if any, validate
+            jq -r '.choices[0].message.content' out.json > "reports/$f.json" || true
+            perl -0777 -pe 's/```(?:json)?\s*|\s*```//g' -i "reports/$f.json" || true
+            if ! jq -e . "reports/$f.json" >/dev/null 2>&1; then
+              echo "::warning::Non-JSON from model for $fp (using empty matches)"
+              echo '{"matches":[]}' > "reports/$f.json"
+            fi
+          done
+
+          # Aggregate all matches across chunks
+          jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
+          COUNT=$(jq 'length' matches_all.json)
+          echo "COUNT=$COUNT" >> $GITHUB_ENV
+          echo "Aggregated $COUNT match(es)"
+
+      - name: Build Markdown report
+        run: |
+          {
+            echo "# Grammar Report (GPT)"
+            if [ -n "${SRC_URL}"   ]; then echo "**URL:** ${SRC_URL}  "; fi
+            if [ -n "${CLIENT_ID}" ]; then echo "**Client ID:** ${CLIENT_ID}  "; fi
+            echo "**Bytes scanned (full):** ${FULL_BYTES}  "
+            echo "**Chunks:** ${CHUNK_COUNT}  "
+            echo "**Issues found:** ${COUNT}"
+            echo
+            echo "## Sample findings (first 100)"
+            jq -r '
+              .[0:100][] |
+              "- **\(.rule // "")**: \(.message // "")
+                 - Context: \"\(.context // "")\"
+                 - Suggestion: \((.suggestion // "—"))"
+            ' matches_all.json
+          } > report.md
+          echo "Report written to report.md"
+
+      - name: Create issue with report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const url = process.env.SRC_URL || '(manual input)';
+            const title = `Grammar report – ${url} – ${new Date().toISOString().slice(0,19)}Z`;
+            const body  = fs.readFileSync('report.md','utf8');
+            const labels = ['grammar-report','gpt'];
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title, body, labels
+            });
+            core.info(`Created issue #${issue.number}`);
+
+      - name: Post ALL findings to Google Doc (optional)
+        env:
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # Apps Script Web App /exec URL
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # Must match IMPORT_API_KEY in Apps Script
+          SRC_URL:   ${{ env.SRC_URL }}
+          CLIENT_ID: ${{ env.CLIENT_ID }}
+          COUNT:     ${{ env.COUNT }}
+        run: |
+          set -euo pipefail
+          echo "Using callback endpoint: ${DOC_CALLBACK_URL:-<unset>}"
+          if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
+            echo "Doc callback secrets not set; skipping."
+            exit 0
+          fi
+
+          # Keep every finding (compact schema)
+          jq '[ .[] | {
+                rule:(.rule // null),
+                message:(.message // null),
+                context:(.context // null),
+                suggestion:(.suggestion // null)
+              } ]' matches_all.json > matches_compact.json
+
+          jq -n --arg url "${SRC_URL:-}" --arg client_id "${CLIENT_ID:-}" \
+                --arg audit_type "single" --argjson total "${COUNT:-0}" \
+                --slurpfile matches matches_compact.json \
+                '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
+              > detail_payload.json
+
+          # POST (follow /exec -> googleusercontent redirect and keep POST)
+          HTTP=$(curl -sS -L --post301 --post302 --post303 -o /tmp/doc_cb_detail.out -w "%{http_code}" \
+            -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: $DOC_CALLBACK_KEY" \
+            --data-binary @detail_payload.json)
+
+          echo "Detail callback HTTP: $HTTP"
+          if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
+            echo "::error::Detail Doc callback failed (HTTP $HTTP). Response:"
+            sed -n '1,200p' /tmp/doc_cb_detail.out
+            exit 1
+          fi
+          echo "Detail Doc callback OK:"
+          sed -n '1,200p' /tmp/doc_cb_detail.out
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grammar-report
+          path: |
+            doc_full.txt
+            chunks/**
+            reports/**
+            matches_all.json
+            report.md
