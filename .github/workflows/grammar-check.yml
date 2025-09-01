@@ -202,13 +202,22 @@ jobs:
             exit 1
           fi
           # Resolve to final signed googleusercontent URL (if any)
-          LOC=$(curl -sS -I "$DOC_CALLBACK_URL" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1 || true)
-          if [ -n "$LOC" ]; then
-            echo "CB_URL=$LOC" >> $GITHUB_ENV
-            echo "Resolved callback URL: $LOC"
+          # First, try to get the redirect location with a HEAD request
+          REDIRECT_URL=$(curl -sS -I -X HEAD "$DOC_CALLBACK_URL" | tr -d '\r' | grep -i '^location:' | cut -d' ' -f2- | tr -d ' \t\n\r' || true)
+          
+          if [ -n "$REDIRECT_URL" ] && [ "$REDIRECT_URL" != "$DOC_CALLBACK_URL" ]; then
+            echo "CB_URL=$REDIRECT_URL" >> $GITHUB_ENV
+            echo "Resolved callback URL: $REDIRECT_URL"
           else
-            echo "CB_URL=$DOC_CALLBACK_URL" >> $GITHUB_ENV
-            echo "Using original callback URL (no redirect exposed)."
+            # If HEAD doesn't work, try with GET to see if we get a redirect
+            REDIRECT_URL=$(curl -sS -I -L "$DOC_CALLBACK_URL" | tr -d '\r' | grep -i '^location:' | tail -1 | cut -d' ' -f2- | tr -d ' \t\n\r' || true)
+            if [ -n "$REDIRECT_URL" ] && [ "$REDIRECT_URL" != "$DOC_CALLBACK_URL" ]; then
+              echo "CB_URL=$REDIRECT_URL" >> $GITHUB_ENV
+              echo "Resolved callback URL (via GET): $REDIRECT_URL"
+            else
+              echo "CB_URL=$DOC_CALLBACK_URL" >> $GITHUB_ENV
+              echo "Using original callback URL (no redirect detected)."
+            fi
           fi
 
       - name: Post ALL findings to Google Doc (resolved URL)
@@ -239,13 +248,29 @@ jobs:
                 '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
               > detail_payload.json
 
-          # POST directly to final URL; preserve POST (no -L). Add api_key with ? or & automatically.
+          # POST directly to final URL; if we get 302, extract redirect and retry
           SEP='?'; case "$CB_URL" in *\?*) SEP='&';; esac
           HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
             -X POST "$CB_URL${SEP}api_key=$DOC_CALLBACK_KEY" \
             -H 'Content-Type: application/json' \
             -H "x-api-key: $DOC_CALLBACK_KEY" \
             --data-binary @detail_payload.json)
+
+          # If we get a 302, extract the redirect URL and try again
+          if [ "$HTTP" -eq 302 ]; then
+            echo "Got 302 redirect, extracting redirect URL..."
+            REDIRECT_URL=$(grep -o 'https://script\.googleusercontent\.com[^"]*' /tmp/doc_cb_detail.out | head -1 || true)
+            if [ -n "$REDIRECT_URL" ]; then
+              echo "Retrying with redirect URL: $REDIRECT_URL"
+              # Decode HTML entities
+              REDIRECT_URL=$(echo "$REDIRECT_URL" | sed 's/&amp;/\&/g')
+              HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
+                -X POST "$REDIRECT_URL" \
+                -H 'Content-Type: application/json' \
+                -H "x-api-key: $DOC_CALLBACK_KEY" \
+                --data-binary @detail_payload.json)
+            fi
+          fi
 
           echo "Detail callback HTTP: $HTTP"
           if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
