@@ -63,7 +63,6 @@ jobs:
           set -euo pipefail
           rm -rf chunks reports
           mkdir -p chunks reports
-          # 15,000 bytes keeps requests small & safe
           split -b 15000 -d -a 3 doc_full.txt chunks/chunk_
           COUNT=$(ls chunks | wc -l | tr -d ' ')
           echo "CHUNK_COUNT=$COUNT" >> $GITHUB_ENV
@@ -91,11 +90,11 @@ jobs:
                 model: $model,
                 response_format: { "type": "json_object" },
                 messages: [
-                  {"role":"system","content":"You are a strict copy editor. Given TEXT, list EVERY spelling, grammar, punctuation, agreement, or style mistake. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}],\"chunk_bytes\":0}. Do not include explanations outside JSON."},
+                  {"role":"system","content":"You are a strict copy editor. Given TEXT, list EVERY spelling, grammar, and punctuation mistakes. Please ignore double spaces; those aren't important. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}],\"chunk_bytes\":0}. Do not include explanations outside JSON."},
                   {"role":"user","content": ("TEXT:\\n\\n" + .)}
                 ],
                 temperature: 0,
-                max_tokens: 4000
+                max_completion_tokens: 4000
               }' "$fp" > req.json
 
               curl -sS -o out.json -w "%{http_code}" \
@@ -107,12 +106,10 @@ jobs:
 
             HTTP=$(try_model "$PRIMARY_MODEL")
             if [ "$HTTP" -ne 200 ]; then
-              # Peek at the error to decide whether to fallback
               ERR_MSG=$(jq -r '.error.message // empty' out.json 2>/dev/null || true)
               ERR_TYPE=$(jq -r '.error.type // empty' out.json 2>/dev/null || true)
               echo "::warning::OpenAI $HTTP for $fp using $PRIMARY_MODEL ($ERR_TYPE) $ERR_MSG"
-
-              if echo "$ERR_MSG$ERR_TYPE" | grep -qiE 'model|not.?found|does.?not.?exist|unsupported|deprecate'; then
+              if echo "$ERR_MSG$ERR_TYPE" | grep -qiE 'model|not.?found|does.?not.?exist|unsupported|deprecat|unknown'; then
                 echo "Retrying $fp with fallback model: $FALLBACK_MODEL"
                 HTTP=$(try_model "$FALLBACK_MODEL")
               fi
@@ -124,7 +121,7 @@ jobs:
               continue
             fi
 
-            # Pull assistant content into reports/$f.json, strip fences if any, validate
+            # Extract assistant JSON; strip code fences; validate
             jq -r '.choices[0].message.content' out.json > "reports/$f.json" || true
             perl -0777 -pe 's/```(?:json)?\s*|\s*```//g' -i "reports/$f.json" || true
             if ! jq -e . "reports/$f.json" >/dev/null 2>&1; then
@@ -133,7 +130,6 @@ jobs:
             fi
           done
 
-          # Aggregate all matches across chunks
           jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
           COUNT=$(jq 'length' matches_all.json)
           echo "COUNT=$COUNT" >> $GITHUB_ENV
@@ -177,14 +173,21 @@ jobs:
 
       - name: Post ALL findings to Google Doc (optional)
         env:
-          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # Apps Script Web App /exec URL
-          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # Must match IMPORT_API_KEY in Apps Script
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # must be Apps Script Web App /exec URL (script.google.com)
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # must match IMPORT_API_KEY in Apps Script
           SRC_URL:   ${{ env.SRC_URL }}
           CLIENT_ID: ${{ env.CLIENT_ID }}
           COUNT:     ${{ env.COUNT }}
         run: |
           set -euo pipefail
           echo "Using callback endpoint: ${DOC_CALLBACK_URL:-<unset>}"
+
+          # Fail fast if someone pasted a Google Doc link instead of the Web App /exec URL
+          if echo "${DOC_CALLBACK_URL:-}" | grep -qi 'docs.google.com'; then
+            echo "::error::DOC_CALLBACK_URL points to a Google Doc. It must be your Apps Script Web App /exec URL (script.google.com)."
+            exit 1
+          fi
+
           if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
             echo "Doc callback secrets not set; skipping."
             exit 0
