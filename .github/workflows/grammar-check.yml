@@ -206,7 +206,7 @@ jobs:
             exit 0
           fi
 
-          # Compact the array we send over; also include as "suggestions" for Apps Script compatibility
+          # Compact array and also expose as "suggestions" for Apps Script compatibility
           jq '[ .[] | {
                 rule:(.rule // null),
                 message:(.message // null),
@@ -221,7 +221,7 @@ jobs:
                   total_suggestions:$total, matches:$m[0], suggestions:$m[0] }' \
               > detail_payload.json
 
-          # Add api_key with ? or & automatically; follow redirect and KEEP POST
+          # Add api_key and follow 302 while keeping POST
           SEP='?'; case "$DOC_CALLBACK_URL" in *\?*) SEP='&';; esac
           HTTP=$(curl -sS -L --post301 --post302 --post303 \
             -o /tmp/doc_cb_detail.out -w "%{http_code}" \
