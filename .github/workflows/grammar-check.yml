@@ -70,7 +70,7 @@ jobs:
           echo "CHUNK_COUNT=$COUNT" >> $GITHUB_ENV
           echo "Created $COUNT chunk(s)"
 
-      # >>> The only change vs your working file: this step is now parallel (2 at a time)
+      # The only change: parallelize and make req/out files unique per chunk to avoid collisions.
       - name: Run GPT proofreading on all chunks (primary gpt-5, fallback gpt-4o) — PARALLEL
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -88,13 +88,14 @@ jobs:
           export OPENAI_API_KEY PRIMARY_MODEL FALLBACK_MODEL
           mkdir -p reports
 
-          # Process chunks in parallel (2 workers). Adjust -P if you want more/fewer.
+          # Process chunks in parallel (2 workers). Increase -P for more concurrency if desired.
           ls chunks | sort | xargs -I{} -P 2 bash -c '
             set -euo pipefail
             f="$1"
             fp="chunks/$1"
-            out="out_${1}.json"
-            rep="reports/$1.json"
+            req="req_${1}.json"     # unique per chunk
+            out="out_${1}.json"     # unique per chunk
+            rep="reports/$1.json"   # unique per chunk
 
             echo "Checking $fp (primary $PRIMARY_MODEL; fallback $FALLBACK_MODEL)"
 
@@ -114,12 +115,12 @@ jobs:
             }
 
             # ----- PRIMARY -----
-            build_req "$PRIMARY_MODEL" > req.json
+            build_req "$PRIMARY_MODEL" > "$req"
             HTTP=$(curl -sS -o "$out" -w "%{http_code}" \
               -X POST https://api.openai.com/v1/chat/completions \
               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
               -H "Content-Type: application/json" \
-              --data-binary @req.json)
+              --data-binary @"$req")
 
             # If primary fails for model-availability or model-unsupported, try fallback once
             if [ "$HTTP" -ne 200 ]; then
@@ -128,12 +129,12 @@ jobs:
               echo "::warning::OpenAI $HTTP on $fp using $PRIMARY_MODEL ($TYP) $ERR"
               if echo "$ERR $TYP" | grep -qiE "model|not.?found|does.?not.?exist|unsupported|unknown|deprecat"; then
                 # ----- FALLBACK -----
-                build_req "$FALLBACK_MODEL" > req.json
+                build_req "$FALLBACK_MODEL" > "$req"
                 HTTP=$(curl -sS -o "$out" -w "%{http_code}" \
                   -X POST https://api.openai.com/v1/chat/completions \
                   -H "Authorization: Bearer ${OPENAI_API_KEY}" \
                   -H "Content-Type: application/json" \
-                  --data-binary @req.json)
+                  --data-binary @"$req")
               fi
             fi
 
@@ -152,7 +153,7 @@ jobs:
             fi
           ' _ {}
 
-          # Aggregate all matches across chunks (same as your working file)
+          # Aggregate all matches across chunks
           jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
           COUNT=$(jq 'length' matches_all.json)
           echo "COUNT=$COUNT" >> $GITHUB_ENV
@@ -196,7 +197,7 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
-      # === keep these two steps EXACTLY as in your working file ===
+      # Unchanged: your working redirect resolve step
       - name: Resolve Apps Script Web App redirect (for POST)
         env:
           DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
@@ -219,6 +220,7 @@ jobs:
             echo "Using original callback URL (no redirect exposed)."
           fi
 
+      # Unchanged: your working POST step
       - name: Post ALL findings to Google Doc (optional)
         env:
           CB_URL: ${{ env.CB_URL }}
