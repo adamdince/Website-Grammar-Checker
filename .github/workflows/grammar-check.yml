@@ -1,4 +1,4 @@
-name: Website Grammar Check (GPT, your prompt)
+name: Website Grammar Check (GPT, parallel)
 
 on:
   repository_dispatch:
@@ -70,10 +70,11 @@ jobs:
           echo "CHUNK_COUNT=$COUNT" >> $GITHUB_ENV
           echo "Created $COUNT chunk(s)"
 
-      - name: Run GPT proofreading on all chunks (primary gpt-5, fallback gpt-4o)
+      - name: Run GPT proofreading on all chunks (parallel; primary gpt-5, fallback gpt-4o)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}   # optional override
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}     # optional override; defaults to gpt-5
+          CONCURRENCY: ${{ vars.CONCURRENCY }}       # optional; defaults to 2
         run: |
           set -euo pipefail
           if [ -z "${OPENAI_API_KEY:-}" ]; then
@@ -83,71 +84,70 @@ jobs:
 
           PRIMARY_MODEL="${OPENAI_MODEL:-gpt-5}"
           FALLBACK_MODEL="gpt-4o"
+          PAR="${CONCURRENCY:-2}"    # how many chunks to process at once
 
-          for f in $(ls chunks | sort); do
-            fp="chunks/$f"
+          export OPENAI_API_KEY PRIMARY_MODEL FALLBACK_MODEL
+          mkdir -p reports
+
+          # Process chunks in parallel using xargs
+          ls chunks | sort | xargs -I{} -P "$PAR" bash -c '
+            set -euo pipefail
+            f="$1"; fp="chunks/$1"; out="out_${1}.json"; rep="reports/$1.json"
+
+            build_req() {
+              MODEL="$1"
+              jq -n --arg model "$MODEL" --rawfile TEXT "$fp" '"'"'{
+                model: $model,
+                response_format: { "type": "json_object" },
+                messages: [
+                  {
+                    "role":"system",
+                    "content":"You are a strict copy editor. Given TEXT, identify EVERY spelling, grammar and punctuation mistake. Ignore double spacing. Return ONLY valid JSON in the following format:\n\n{\n  \"matches\": [\n    {\n      \"rule\": \"Spelling|Grammar|Punctuation\",\n      \"message\": \"What is wrong\",\n      \"context\": \"Short snippet around the error\",\n      \"suggestion\": \"Best single replacement or null\"\n    }\n  ]\n}\n\n- \"rule\" must be one of: \"Spelling\", \"Grammar\", or \"Punctuation\".\n- \"message\" should briefly explain the issue.\n- \"context\" should contain just enough surrounding text to locate the error.\n- \"suggestion\" should contain the corrected text, or null if no single replacement applies.\n- Do not output prose, explanations, or text outside of JSON."
+                  },
+                  { "role":"user", "content": ("TEXT:\n\n" + $TEXT) }
+                ]
+              }'"'"'
+            }
+
             echo "Checking $fp (primary $PRIMARY_MODEL; fallback $FALLBACK_MODEL)"
 
-            # ----- PRIMARY -----
-            jq -n --arg model "$PRIMARY_MODEL" --rawfile TEXT "$fp" '{
-              model: $model,
-              response_format: { "type": "json_object" },
-              messages: [
-                {
-                  "role":"system",
-                  "content":"You are a strict copy editor. Given TEXT, identify EVERY spelling, grammar and punctuation mistake. Ignore double spacing. Return ONLY valid JSON in the following format:\n\n{\n  \"matches\": [\n    {\n      \"rule\": \"Spelling|Grammar|Punctuation\",\n      \"message\": \"What is wrong\",\n      \"context\": \"Short snippet around the error\",\n      \"suggestion\": \"Best single replacement or null\"\n    }\n  ]\n}\n\n- \"rule\" must be one of: \"Spelling\", \"Grammar\", or \"Punctuation\".\n- \"message\" should briefly explain the issue.\n- \"context\" should contain just enough surrounding text to locate the error.\n- \"suggestion\" should contain the corrected text, or null if no single replacement applies.\n- Do not output prose, explanations, or text outside of JSON."
-                },
-                { "role":"user", "content": ("TEXT:\n\n" + $TEXT) }
-              ]
-            }' > req.json
-
-            HTTP=$(curl -sS -o out.json -w "%{http_code}" \
+            # Try primary model
+            build_req "$PRIMARY_MODEL" > req.json
+            HTTP=$(curl -sS -o "$out" -w "%{http_code}" \
               -X POST https://api.openai.com/v1/chat/completions \
               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
               -H "Content-Type: application/json" \
-              --data-binary @req.json)
+              --data-binary @req.json) || HTTP=000
 
-            # If primary fails for model-availability or model-unsupported, try fallback once
+            # If primary fails with model-related error, retry once with fallback
             if [ "$HTTP" -ne 200 ]; then
-              ERR=$(jq -r '.error.message // empty' out.json 2>/dev/null || true)
-              TYP=$(jq -r '.error.type // empty' out.json 2>/dev/null || true)
-              echo "::warning::OpenAI $HTTP on $fp using $PRIMARY_MODEL ($TYP) $ERR"
-              if echo "$ERR $TYP" | grep -qiE 'model|not.?found|does.?not.?exist|unsupported|unknown|deprecat'; then
-                # ----- FALLBACK -----
-                jq -n --arg model "$FALLBACK_MODEL" --rawfile TEXT "$fp" '{
-                  model: $model,
-                  response_format: { "type": "json_object" },
-                  messages: [
-                    {
-                      "role":"system",
-                      "content":"You are a strict copy editor. Given TEXT, identify EVERY spelling, grammar and punctuation mistake. Ignore double spacing. Return ONLY valid JSON in the following format:\n\n{\n  \"matches\": [\n    {\n      \"rule\": \"Spelling|Grammar|Punctuation\",\n      \"message\": \"What is wrong\",\n      \"context\": \"Short snippet around the error\",\n      \"suggestion\": \"Best single replacement or null\"\n    }\n  ]\n}\n\n- \"rule\" must be one of: \"Spelling\", \"Grammar\", or \"Punctuation\".\n- \"message\" should briefly explain the issue.\n- \"context\" should contain just enough surrounding text to locate the error.\n- \"suggestion\" should contain the corrected text, or null if no single replacement applies.\n- Do not output prose, explanations, or text outside of JSON."
-                    },
-                    { "role":"user", "content": ("TEXT:\n\n" + $TEXT) }
-                  ]
-                }' > req.json
-
-                HTTP=$(curl -sS -o out.json -w "%{http_code}" \
+              ERR=$(jq -r ".error.message // empty" "$out" 2>/dev/null || true)
+              TYP=$(jq -r ".error.type // empty"   "$out" 2>/dev/null || true)
+              if echo "$ERR $TYP" | grep -qiE "model|not.?found|does.?not.?exist|unsupported|unknown|deprecat"; then
+                build_req "$FALLBACK_MODEL" > req.json
+                HTTP=$(curl -sS -o "$out" -w "%{http_code}" \
                   -X POST https://api.openai.com/v1/chat/completions \
                   -H "Authorization: Bearer ${OPENAI_API_KEY}" \
                   -H "Content-Type: application/json" \
-                  --data-binary @req.json)
+                  --data-binary @req.json) || HTTP=000
               fi
             fi
 
+            # Write JSON or empty on failure; no regex fence stripping to avoid shell issues
             if [ "$HTTP" -ne 200 ]; then
-              echo "::warning::Model returned $HTTP for $fp after fallback; using empty matches"
-              echo '{"matches":[]}' > "reports/$f.json"
-              continue
+              echo "{\"matches\":[]}" > "$rep"
+            else
+              jq -r ".choices[0].message.content" "$out" > "$rep" || true
+              # If not valid JSON, try removing fence-only lines; otherwise fall back to empty
+              if ! jq -e . "$rep" >/dev/null 2>&1; then
+                awk '"'"'!/^[[:space:]]*```(json)?[[:space:]]*$/ && !/^[[:space:]]*```[[:space:]]*$/'"'"' "$rep" > "$rep.tmp" || true
+                mv -f "$rep.tmp" "$rep" 2>/dev/null || true
+              fi
+              jq -e . "$rep" >/dev/null 2>&1 || echo "{\"matches\":[]}" > "$rep"
             fi
 
-            # Extract JSON; strip any code fences; validate
-            jq -r '.choices[0].message.content' out.json > "reports/$f.json" || true
-            perl -0777 -pe 's/```(?:json)?\s*|\s*```//g' -i "reports/$f.json" || true
-            if ! jq -e . "reports/$f.json" >/dev/null 2>&1; then
-              echo "::warning::Non-JSON from model for $fp (using empty matches)"
-              echo '{"matches":[]}' > "reports/$f.json"
-            fi
-          done
+            true
+          ' _ {}
 
           # Aggregate all matches across chunks
           jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
@@ -249,7 +249,7 @@ jobs:
             --data-binary @detail_payload.json)
 
           echo "Detail callback HTTP: $HTTP"
-          # treat 3xx as success; only fail on 4xx / 5xx
+          # Treat 3xx as success; only fail on 4xx / 5xx
           if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 400 ]; then
             echo "::error::Detail Doc callback failed (HTTP $HTTP). Response:"
             sed -n '1,200p' /tmp/doc_cb_detail.out
