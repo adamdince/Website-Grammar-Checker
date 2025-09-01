@@ -1,4 +1,4 @@
-name: Website Grammar Check (GPT-5)
+name: Website Grammar Check (GPT-5 w/ fallback)
 
 on:
   repository_dispatch:
@@ -63,152 +63,40 @@ jobs:
           set -euo pipefail
           rm -rf chunks reports
           mkdir -p chunks reports
+          # 15,000 bytes keeps requests small & safe
           split -b 15000 -d -a 3 doc_full.txt chunks/chunk_
           COUNT=$(ls chunks | wc -l | tr -d ' ')
           echo "CHUNK_COUNT=$COUNT" >> $GITHUB_ENV
           echo "Created $COUNT chunk(s)"
 
-      - name: Run GPT-5 proofreading on all chunks
+      - name: Run GPT proofreading on all chunks (try gpt-5, fallback to gpt-4o)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}   # optional override
         run: |
           set -euo pipefail
           if [ -z "${OPENAI_API_KEY:-}" ]; then
             echo "::error::OPENAI_API_KEY secret is not set"; exit 1
           fi
-          MODEL="${OPENAI_MODEL:-gpt-5}"
+          PRIMARY_MODEL="${OPENAI_MODEL:-gpt-5}"
+          FALLBACK_MODEL="gpt-4o"
 
           for f in $(ls chunks | sort); do
             fp="chunks/$f"
-            echo "Checking $fp with model $MODEL"
+            echo "Checking $fp (primary: $PRIMARY_MODEL, fallback: $FALLBACK_MODEL)"
 
-            # Force strict JSON output with a fixed schema we aggregate later
-            jq -Rs --arg model "$MODEL" '{
-              model: $model,
-              response_format: { "type": "json_object" },
-              messages: [
-                {"role":"system","content":"You are a strict copy editor. Given TEXT, list EVERY spelling, grammar, punctuation, agreement, or style mistake. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}],\"chunk_bytes\":0}. Do not include explanations outside JSON."},
-                {"role":"user","content": ("TEXT:\\n\\n" + .)}
-              ],
-              temperature: 0,
-              max_tokens: 4000
-            }' "$fp" > req.json
+            try_model() {
+              local MODEL="$1"
+              jq -Rs --arg model "$MODEL" '{
+                model: $model,
+                response_format: { "type": "json_object" },
+                messages: [
+                  {"role":"system","content":"You are a strict copy editor. Given TEXT, list EVERY spelling, grammar, punctuation, agreement, or style mistake. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}],\"chunk_bytes\":0}. Do not include explanations outside JSON."},
+                  {"role":"user","content": ("TEXT:\\n\\n" + .)}
+                ],
+                temperature: 0,
+                max_tokens: 4000
+              }' "$fp" > req.json
 
-            HTTP=$(curl -sS -o out.json -w "%{http_code}" \
-              -X POST https://api.openai.com/v1/chat/completions \
-              -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-              -H "Content-Type: application/json" \
-              --data-binary @req.json)
-
-            if [ "$HTTP" -ne 200 ]; then
-              echo "::warning::OpenAI returned $HTTP for $fp (using empty matches)"
-              echo '{"matches":[]}' > "reports/$f.json"
-              continue
-            fi
-
-            jq -r '.choices[0].message.content' out.json > "reports/$f.json" || true
-            perl -0777 -pe 's/```(?:json)?\s*|\s*```//g' -i "reports/$f.json" || true
-            if ! jq -e . "reports/$f.json" >/dev/null 2>&1; then
-              echo "::warning::Non-JSON from OpenAI for $fp (using empty matches)"
-              echo '{"matches":[]}' > "reports/$f.json"
-            fi
-          done
-
-          # Aggregate all matches across chunks
-          jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
-          COUNT=$(jq 'length' matches_all.json)
-          echo "COUNT=$COUNT" >> $GITHUB_ENV
-          echo "Aggregated $COUNT match(es)"
-
-      - name: Build Markdown report
-        run: |
-          {
-            echo "# Grammar Report (GPT-5)"
-            if [ -n "${SRC_URL}"   ]; then echo "**URL:** ${SRC_URL}  "; fi
-            if [ -n "${CLIENT_ID}" ]; then echo "**Client ID:** ${CLIENT_ID}  "; fi
-            echo "**Bytes scanned (full):** ${FULL_BYTES}  "
-            echo "**Chunks:** ${CHUNK_COUNT}  "
-            echo "**Issues found:** ${COUNT}"
-            echo
-            echo "## Sample findings (first 100)"
-            jq -r '
-              .[0:100][] |
-              "- **\(.rule // \"\")**: \(.message // \"\")
-                 - Context: \"\(.context // \"\")\"
-                 - Suggestion: \((.suggestion // \"—\"))"
-            ' matches_all.json
-          } > report.md
-          echo "Report written to report.md"
-
-      - name: Create issue with report
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const url = process.env.SRC_URL || '(manual input)';
-            const title = `Grammar report – ${url} – ${new Date().toISOString().slice(0,19)}Z`;
-            const body  = fs.readFileSync('report.md','utf8');
-            const labels = ['grammar-report','gpt-5'];
-            const { data: issue } = await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title, body, labels
-            });
-            core.info(`Created issue #${issue.number}`);
-
-      - name: Post ALL findings to Google Doc (optional)
-        env:
-          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
-          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
-          SRC_URL:   ${{ env.SRC_URL }}
-          CLIENT_ID: ${{ env.CLIENT_ID }}
-          COUNT:     ${{ env.COUNT }}
-        run: |
-          set -euo pipefail
-          echo "Using callback endpoint: ${DOC_CALLBACK_URL:-<unset>}"
-          if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
-            echo "Doc callback secrets not set; skipping."
-            exit 0
-          fi
-
-          # Keep every finding (compact schema)
-          jq '[ .[] | {
-                rule:(.rule // null),
-                message:(.message // null),
-                context:(.context // null),
-                suggestion:(.suggestion // null)
-              } ]' matches_all.json > matches_compact.json
-
-          jq -n --arg url "${SRC_URL:-}" --arg client_id "${CLIENT_ID:-}" \
-                --arg audit_type "single" --argjson total "${COUNT:-0}" \
-                --slurpfile matches matches_compact.json \
-                '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
-              > detail_payload.json
-
-          # POST (follow /exec redirect and keep POST)
-          HTTP=$(curl -sS -L --post301 --post302 --post303 -o /tmp/doc_cb_detail.out -w "%{http_code}" \
-            -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
-            -H 'Content-Type: application/json' \
-            -H "x-api-key: $DOC_CALLBACK_KEY" \
-            --data-binary @detail_payload.json)
-
-          echo "Detail callback HTTP: $HTTP"
-          if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
-            echo "::error::Detail Doc callback failed (HTTP $HTTP). Response:"
-            sed -n '1,200p' /tmp/doc_cb_detail.out
-            exit 1
-          fi
-          echo "Detail Doc callback OK:"
-          sed -n '1,200p' /tmp/doc_cb_detail.out
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: grammar-report
-          path: |
-            doc_full.txt
-            chunks/**
-            reports/**
-            matches_all.json
-            report.md
+              curl -sS -o out.json -w "%{http_code}" \
+                -X POST https://api.openai.com/v1/cha
