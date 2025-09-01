@@ -1,4 +1,4 @@
-name: Website Grammar Check (GPT-5 w/ fallback)
+name: Website Grammar Check (GPT)
 
 on:
   repository_dispatch:
@@ -26,6 +26,7 @@ jobs:
 
       - name: Install tools
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq lynx perl
 
@@ -51,7 +52,8 @@ jobs:
           fi
 
           if [ ! -s doc_full.txt ]; then
-            echo "::error::No content to analyze (neither URL nor text)"; exit 1
+            echo "::error::No content to analyze (neither URL nor text)"
+            exit 1
           fi
 
           BYTES=$(wc -c < doc_full.txt)
@@ -68,50 +70,68 @@ jobs:
           echo "CHUNK_COUNT=$COUNT" >> $GITHUB_ENV
           echo "Created $COUNT chunk(s)"
 
-      - name: Run GPT proofreading on all chunks (try gpt-5, fallback to gpt-4o)
+      - name: Run GPT proofreading on all chunks (primary gpt-5, fallback gpt-4o)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}   # optional override
         run: |
           set -euo pipefail
           if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY secret is not set"; exit 1
+            echo "::error::OPENAI_API_KEY secret is not set"
+            exit 1
           fi
+
           PRIMARY_MODEL="${OPENAI_MODEL:-gpt-5}"
           FALLBACK_MODEL="gpt-4o"
 
           for f in $(ls chunks | sort); do
             fp="chunks/$f"
-            echo "Checking $fp (primary: $PRIMARY_MODEL, fallback: $FALLBACK_MODEL)"
+            echo "Checking $fp with primary $PRIMARY_MODEL; fallback $FALLBACK_MODEL"
 
-            try_model() {
-              local MODEL="$1"
-              jq -Rs --arg model "$MODEL" '{
-                model: $model,
-                response_format: { "type": "json_object" },
-                messages: [
-                  {"role":"system","content":"You are a strict copy editor. Given TEXT, list EVERY spelling, grammar, and punctuation mistakes. Please ignore double spaces; those aren't important. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}],\"chunk_bytes\":0}. Do not include explanations outside JSON."},
-                  {"role":"user","content": ("TEXT:\\n\\n" + .)}
-                ],
-                temperature: 0,
-                max_completion_tokens: 4000
-              }' "$fp" > req.json
+            # ---- Try primary model ----
+            jq -n --arg model "$PRIMARY_MODEL" --rawfile TEXT "$fp" '{
+              model: $model,
+              response_format: { "type": "json_object" },
+              messages: [
+                {
+                  "role":"system",
+                  "content":"You are a strict copy editor. Given TEXT, list EVERY spelling, and grammar mistakes. Please do not pay attention to double spacing. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}]}. No prose outside JSON."
+                },
+                { "role":"user", "content": ("TEXT:\n\n" + $TEXT) }
+              ],
+              temperature: 0
+            }' > req.json
 
-              curl -sS -o out.json -w "%{http_code}" \
-                -X POST https://api.openai.com/v1/chat/completions \
-                -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-                -H "Content-Type: application/json" \
-                --data-binary @req.json
-            }
+            HTTP=$(curl -sS -o out.json -w "%{http_code}" \
+              -X POST https://api.openai.com/v1/chat/completions \
+              -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+              -H "Content-Type: application/json" \
+              --data-binary @req.json)
 
-            HTTP=$(try_model "$PRIMARY_MODEL")
+            # If primary failed with model-related error, retry with fallback
             if [ "$HTTP" -ne 200 ]; then
-              ERR_MSG=$(jq -r '.error.message // empty' out.json 2>/dev/null || true)
-              ERR_TYPE=$(jq -r '.error.type // empty' out.json 2>/dev/null || true)
-              echo "::warning::OpenAI $HTTP for $fp using $PRIMARY_MODEL ($ERR_TYPE) $ERR_MSG"
-              if echo "$ERR_MSG$ERR_TYPE" | grep -qiE 'model|not.?found|does.?not.?exist|unsupported|deprecat|unknown'; then
-                echo "Retrying $fp with fallback model: $FALLBACK_MODEL"
-                HTTP=$(try_model "$FALLBACK_MODEL")
+              ERR=$(jq -r '.error.message // empty' out.json 2>/dev/null || true)
+              TYP=$(jq -r '.error.type // empty' out.json 2>/dev/null || true)
+              echo "::warning::OpenAI $HTTP on $fp using $PRIMARY_MODEL ($TYP) $ERR"
+              if echo "$ERR $TYP" | grep -qiE 'model|not.?found|does.?not.?exist|unsupported|unknown|deprecat'; then
+                jq -n --arg model "$FALLBACK_MODEL" --rawfile TEXT "$fp" '{
+                  model: $model,
+                  response_format: { "type": "json_object" },
+                  messages: [
+                    {
+                      "role":"system",
+                      "content":"You are a strict copy editor. Given TEXT, list EVERY spelling, grammar, punctuation, agreement, or style mistake. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}]}. No prose outside JSON."
+                    },
+                    { "role":"user", "content": ("TEXT:\n\n" + $TEXT) }
+                  ],
+                  temperature: 0
+                }' > req.json
+
+                HTTP=$(curl -sS -o out.json -w "%{http_code}" \
+                  -X POST https://api.openai.com/v1/chat/completions \
+                  -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @req.json)
               fi
             fi
 
@@ -121,7 +141,7 @@ jobs:
               continue
             fi
 
-            # Extract assistant JSON; strip code fences; validate
+            # Extract JSON; strip any code fences; validate
             jq -r '.choices[0].message.content' out.json > "reports/$f.json" || true
             perl -0777 -pe 's/```(?:json)?\s*|\s*```//g' -i "reports/$f.json" || true
             if ! jq -e . "reports/$f.json" >/dev/null 2>&1; then
@@ -130,6 +150,7 @@ jobs:
             fi
           done
 
+          # Aggregate all matches across chunks
           jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
           COUNT=$(jq 'length' matches_all.json)
           echo "COUNT=$COUNT" >> $GITHUB_ENV
@@ -137,6 +158,7 @@ jobs:
 
       - name: Build Markdown report
         run: |
+          set -euo pipefail
           {
             echo "# Grammar Report (GPT)"
             if [ -n "${SRC_URL}"   ]; then echo "**URL:** ${SRC_URL}  "; fi
@@ -173,27 +195,27 @@ jobs:
 
       - name: Post ALL findings to Google Doc (optional)
         env:
-          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # must be Apps Script Web App /exec URL (script.google.com)
-          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # must match IMPORT_API_KEY in Apps Script
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # Apps Script Web App /exec URL
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # Must match IMPORT_API_KEY in Apps Script
           SRC_URL:   ${{ env.SRC_URL }}
           CLIENT_ID: ${{ env.CLIENT_ID }}
           COUNT:     ${{ env.COUNT }}
         run: |
           set -euo pipefail
-          echo "Using callback endpoint: ${DOC_CALLBACK_URL:-<unset>}"
+          echo "Callback endpoint: ${DOC_CALLBACK_URL:-<unset>}"
 
-          # Fail fast if someone pasted a Google Doc link instead of the Web App /exec URL
-          if echo "${DOC_CALLBACK_URL:-}" | grep -qi 'docs.google.com'; then
-            echo "::error::DOC_CALLBACK_URL points to a Google Doc. It must be your Apps Script Web App /exec URL (script.google.com)."
-            exit 1
-          fi
-
+          # Guard: must be script.google.com or script.googleusercontent.com (NOT docs.google.com)
           if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
             echo "Doc callback secrets not set; skipping."
             exit 0
           fi
+          HOST=$(printf '%s\n' "$DOC_CALLBACK_URL" | sed -E 's#^[a-z]+://([^/]+)/.*#\1#')
+          case "$HOST" in
+            script.google.com|script.googleusercontent.com) ;;
+            *) echo "::error::DOC_CALLBACK_URL host is $HOST. It must be script.google.com (Web App /exec)."; exit 1 ;;
+          esac
 
-          # Keep every finding (compact schema)
+          # Build compact ALL-matches payload
           jq '[ .[] | {
                 rule:(.rule // null),
                 message:(.message // null),
@@ -221,7 +243,7 @@ jobs:
             exit 1
           fi
           echo "Detail Doc callback OK:"
-          sed -n '1,200p' /tmp/doc_cb_detail.out
+          sed -n '1,120p' /tmp/doc_cb_detail.out
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
