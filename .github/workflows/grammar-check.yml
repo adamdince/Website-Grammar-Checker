@@ -70,10 +70,10 @@ jobs:
           echo "CHUNK_COUNT=$COUNT" >> $GITHUB_ENV
           echo "Created $COUNT chunk(s)"
 
-      - name: Run GPT proofreading on all chunks (parallel; primary gpt-5, fallback gpt-4o)
+      - name: Run GPT proofreading on all chunks (parallel; primary gpt-4o, fallback gpt-4-turbo)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}   # optional override (defaults to gpt-5)
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}   # optional override (defaults to gpt-4o)
         run: |
           set -euo pipefail
           if [ -z "${OPENAI_API_KEY:-}" ]; then
@@ -81,15 +81,15 @@ jobs:
             exit 1
           fi
 
-          PRIMARY_MODEL="${OPENAI_MODEL:-gpt-5}"
-          FALLBACK_MODEL="gpt-4o"
+          PRIMARY_MODEL="${OPENAI_MODEL:-gpt-4o}"
+          FALLBACK_MODEL="gpt-4-turbo"
           export OPENAI_API_KEY PRIMARY_MODEL FALLBACK_MODEL
           mkdir -p reports
 
           # Process up to 2 chunks at once (tweak -P 2 for more)
-          ls chunks | sort | xargs -I{} -P 2 bash -lc '
+          ls chunks | sort | xargs -I{} -P 2 bash -c '
             set -euo pipefail
-            f="{}"; fp="chunks/$f"; out="out_${f}.json"; rep="reports/$f.json"
+            f="$1"; fp="chunks/$f"; out="out_${f}.json"; rep="reports/$f.json"
 
             build_req() {
               local MODEL="$1"
@@ -135,12 +135,13 @@ jobs:
               echo "{\"matches\":[]}" > "$rep"
             else
               jq -r ".choices[0].message.content" "$out" > "$rep" || true
-              perl -0777 -pe "s/```(?:json)?\\s*|\\s*```//g" -i "$rep" || true
+              # Fix: Use sed instead of perl with problematic regex
+              sed -i "s/\`\`\`json\s*//g; s/\s*\`\`\`//g" "$rep" || true
               jq -e . "$rep" >/dev/null 2>&1 || echo "{\"matches\":[]}" > "$rep"
             fi
 
             true
-          '
+          ' -- {}
 
           # Aggregate all matches across chunks
           jq -s '[.[] | .matches] | flatten' reports/*.json > matches_all.json
@@ -200,14 +201,15 @@ jobs:
             echo "::error::DOC_CALLBACK_URL points to a Google Doc. Use the Web App /exec URL from Apps Script deployments."
             exit 1
           fi
-          # Resolve to final signed googleusercontent URL (if any)
-          LOC=$(curl -sS -I "$DOC_CALLBACK_URL" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1 || true)
-          if [ -n "$LOC" ]; then
-            echo "CB_URL=$LOC" >> $GITHUB_ENV
-            echo "Resolved callback URL: $LOC"
+          # Resolve to final signed googleusercontent URL (follow redirects)
+          LOC=$(curl -sS -I -L "$DOC_CALLBACK_URL" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1 || true)
+          FINAL_URL=$(curl -sS -I -L "$DOC_CALLBACK_URL" | tr -d '\r' | grep -i '^location:' | tail -1 | cut -d' ' -f2- || echo "$DOC_CALLBACK_URL")
+          if [ -n "$FINAL_URL" ] && [ "$FINAL_URL" != "$DOC_CALLBACK_URL" ]; then
+            echo "CB_URL=$FINAL_URL" >> $GITHUB_ENV
+            echo "Resolved callback URL: $FINAL_URL"
           else
             echo "CB_URL=$DOC_CALLBACK_URL" >> $GITHUB_ENV
-            echo "Using original callback URL (no redirect exposed)."
+            echo "Using original callback URL (no redirect detected)."
           fi
 
       - name: Post ALL findings to Google Doc (resolved URL)
@@ -238,9 +240,9 @@ jobs:
                 '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
               > detail_payload.json
 
-          # POST directly to final URL; preserve POST (no -L). Add api_key with ? or & automatically.
+          # POST to final URL with redirect following; Add api_key with ? or & automatically.
           SEP='?'; case "$CB_URL" in *\?*) SEP='&';; esac
-          HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
+          HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" -L \
             -X POST "$CB_URL${SEP}api_key=$DOC_CALLBACK_KEY" \
             -H 'Content-Type: application/json' \
             -H "x-api-key: $DOC_CALLBACK_KEY" \
