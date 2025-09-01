@@ -201,15 +201,14 @@ jobs:
             echo "::error::DOC_CALLBACK_URL points to a Google Doc. Use the Web App /exec URL from Apps Script deployments."
             exit 1
           fi
-          # Resolve to final signed googleusercontent URL (follow redirects)
-          LOC=$(curl -sS -I -L "$DOC_CALLBACK_URL" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1 || true)
-          FINAL_URL=$(curl -sS -I -L "$DOC_CALLBACK_URL" | tr -d '\r' | grep -i '^location:' | tail -1 | cut -d' ' -f2- || echo "$DOC_CALLBACK_URL")
-          if [ -n "$FINAL_URL" ] && [ "$FINAL_URL" != "$DOC_CALLBACK_URL" ]; then
-            echo "CB_URL=$FINAL_URL" >> $GITHUB_ENV
-            echo "Resolved callback URL: $FINAL_URL"
+          # Resolve to final signed googleusercontent URL (if any)
+          LOC=$(curl -sS -I "$DOC_CALLBACK_URL" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1 || true)
+          if [ -n "$LOC" ]; then
+            echo "CB_URL=$LOC" >> $GITHUB_ENV
+            echo "Resolved callback URL: $LOC"
           else
             echo "CB_URL=$DOC_CALLBACK_URL" >> $GITHUB_ENV
-            echo "Using original callback URL (no redirect detected)."
+            echo "Using original callback URL (no redirect exposed)."
           fi
 
       - name: Post ALL findings to Google Doc (resolved URL)
@@ -240,9 +239,9 @@ jobs:
                 '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
               > detail_payload.json
 
-          # POST to final URL with redirect following; Add api_key with ? or & automatically.
+          # POST directly to final URL; preserve POST (no -L). Add api_key with ? or & automatically.
           SEP='?'; case "$CB_URL" in *\?*) SEP='&';; esac
-          HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" -L \
+          HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
             -X POST "$CB_URL${SEP}api_key=$DOC_CALLBACK_KEY" \
             -H 'Content-Type: application/json' \
             -H "x-api-key: $DOC_CALLBACK_KEY" \
