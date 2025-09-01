@@ -1,4 +1,4 @@
-name: Website Grammar Check (GPT)
+name: Website Grammar Check (GPT, your prompt)
 
 on:
   repository_dispatch:
@@ -86,20 +86,19 @@ jobs:
 
           for f in $(ls chunks | sort); do
             fp="chunks/$f"
-            echo "Checking $fp with primary $PRIMARY_MODEL; fallback $FALLBACK_MODEL"
+            echo "Checking $fp (primary $PRIMARY_MODEL; fallback $FALLBACK_MODEL)"
 
-            # ---- Try primary model ----
+            # ----- PRIMARY -----
             jq -n --arg model "$PRIMARY_MODEL" --rawfile TEXT "$fp" '{
               model: $model,
               response_format: { "type": "json_object" },
               messages: [
                 {
                   "role":"system",
-                  "content":"You are a strict copy editor. Given TEXT, list EVERY spelling, and grammar mistakes. Please do not pay attention to double spacing. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}]}. No prose outside JSON."
+                  "content":"You are a strict copy editor. Given TEXT, identify EVERY spelling, grammar and punctuation mistake. Ignore double spacing. Return ONLY valid JSON in the following format:\n\n{\n  \"matches\": [\n    {\n      \"rule\": \"Spelling|Grammar|Punctuation\",\n      \"message\": \"What is wrong\",\n      \"context\": \"Short snippet around the error\",\n      \"suggestion\": \"Best single replacement or null\"\n    }\n  ]\n}\n\n- \"rule\" must be one of: \"Spelling\", \"Grammar\", or \"Punctuation\".\n- \"message\" should briefly explain the issue.\n- \"context\" should contain just enough surrounding text to locate the error.\n- \"suggestion\" should contain the corrected text, or null if no single replacement applies.\n- Do not output prose, explanations, or text outside of JSON."
                 },
                 { "role":"user", "content": ("TEXT:\n\n" + $TEXT) }
-              ],
-              temperature: 0
+              ]
             }' > req.json
 
             HTTP=$(curl -sS -o out.json -w "%{http_code}" \
@@ -108,23 +107,23 @@ jobs:
               -H "Content-Type: application/json" \
               --data-binary @req.json)
 
-            # If primary failed with model-related error, retry with fallback
+            # If primary fails for model-availability or model-unsupported, try fallback once
             if [ "$HTTP" -ne 200 ]; then
               ERR=$(jq -r '.error.message // empty' out.json 2>/dev/null || true)
               TYP=$(jq -r '.error.type // empty' out.json 2>/dev/null || true)
               echo "::warning::OpenAI $HTTP on $fp using $PRIMARY_MODEL ($TYP) $ERR"
               if echo "$ERR $TYP" | grep -qiE 'model|not.?found|does.?not.?exist|unsupported|unknown|deprecat'; then
+                # ----- FALLBACK -----
                 jq -n --arg model "$FALLBACK_MODEL" --rawfile TEXT "$fp" '{
                   model: $model,
                   response_format: { "type": "json_object" },
                   messages: [
                     {
                       "role":"system",
-                      "content":"You are a strict copy editor. Given TEXT, list EVERY spelling, grammar, punctuation, agreement, or style mistake. Output ONLY valid JSON: {\"matches\":[{\"rule\":\"Spelling|Grammar|Punctuation|Agreement|Style\",\"message\":\"what is wrong\",\"context\":\"short snippet around the error\",\"suggestion\":\"best single replacement or null\"}]}. No prose outside JSON."
+                      "content":"You are a strict copy editor. Given TEXT, identify EVERY spelling, grammar and punctuation mistake. Ignore double spacing. Return ONLY valid JSON in the following format:\n\n{\n  \"matches\": [\n    {\n      \"rule\": \"Spelling|Grammar|Punctuation\",\n      \"message\": \"What is wrong\",\n      \"context\": \"Short snippet around the error\",\n      \"suggestion\": \"Best single replacement or null\"\n    }\n  ]\n}\n\n- \"rule\" must be one of: \"Spelling\", \"Grammar\", or \"Punctuation\".\n- \"message\" should briefly explain the issue.\n- \"context\" should contain just enough surrounding text to locate the error.\n- \"suggestion\" should contain the corrected text, or null if no single replacement applies.\n- Do not output prose, explanations, or text outside of JSON."
                     },
                     { "role":"user", "content": ("TEXT:\n\n" + $TEXT) }
-                  ],
-                  temperature: 0
+                  ]
                 }' > req.json
 
                 HTTP=$(curl -sS -o out.json -w "%{http_code}" \
@@ -136,7 +135,7 @@ jobs:
             fi
 
             if [ "$HTTP" -ne 200 ]; then
-              echo "::warning::OpenAI returned $HTTP for $fp after fallback; using empty matches"
+              echo "::warning::Model returned $HTTP for $fp after fallback; using empty matches"
               echo '{"matches":[]}' > "reports/$f.json"
               continue
             fi
@@ -159,6 +158,7 @@ jobs:
       - name: Build Markdown report
         run: |
           set -euo pipefail
+          test -f matches_all.json || echo '[]' > matches_all.json
           {
             echo "# Grammar Report (GPT)"
             if [ -n "${SRC_URL}"   ]; then echo "**URL:** ${SRC_URL}  "; fi
@@ -193,29 +193,42 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
+      - name: Resolve Apps Script Web App redirect (for POST)
+        env:
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOC_CALLBACK_URL:-}" ]; then
+            echo "::notice::No DOC_CALLBACK_URL configured; skipping resolve"
+            exit 0
+          fi
+          if echo "${DOC_CALLBACK_URL}" | grep -qi 'docs.google.com'; then
+            echo "::error::DOC_CALLBACK_URL points to a Google Doc. Use the Web App /exec URL from Apps Script deployments."
+            exit 1
+          fi
+          LOC=$(curl -sS -I "$DOC_CALLBACK_URL" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1 || true)
+          if [ -n "$LOC" ]; then
+            echo "CB_URL=$LOC" >> $GITHUB_ENV
+            echo "Resolved callback URL: $LOC"
+          else
+            echo "CB_URL=$DOC_CALLBACK_URL" >> $GITHUB_ENV
+            echo "Using original callback URL (no redirect exposed)."
+          fi
+
       - name: Post ALL findings to Google Doc (optional)
         env:
-          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # Apps Script Web App /exec URL
-          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # Must match IMPORT_API_KEY in Apps Script
+          CB_URL: ${{ env.CB_URL }}
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
           SRC_URL:   ${{ env.SRC_URL }}
           CLIENT_ID: ${{ env.CLIENT_ID }}
           COUNT:     ${{ env.COUNT }}
         run: |
           set -euo pipefail
-          echo "Callback endpoint: ${DOC_CALLBACK_URL:-<unset>}"
-
-          # Guard: must be script.google.com or script.googleusercontent.com (NOT docs.google.com)
-          if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
+          if [ -z "${CB_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
             echo "Doc callback secrets not set; skipping."
             exit 0
           fi
-          HOST=$(printf '%s\n' "$DOC_CALLBACK_URL" | sed -E 's#^[a-z]+://([^/]+)/.*#\1#')
-          case "$HOST" in
-            script.google.com|script.googleusercontent.com) ;;
-            *) echo "::error::DOC_CALLBACK_URL host is $HOST. It must be script.google.com (Web App /exec)."; exit 1 ;;
-          esac
 
-          # Build compact ALL-matches payload
           jq '[ .[] | {
                 rule:(.rule // null),
                 message:(.message // null),
@@ -229,9 +242,8 @@ jobs:
                 '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
               > detail_payload.json
 
-          # POST (follow /exec -> googleusercontent redirect and keep POST)
-          HTTP=$(curl -sS -L --post301 --post302 --post303 -o /tmp/doc_cb_detail.out -w "%{http_code}" \
-            -X POST "$DOC_CALLBACK_URL?api_key=$DOC_CALLBACK_KEY" \
+          HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
+            -X POST "$CB_URL?api_key=$DOC_CALLBACK_KEY" \
             -H 'Content-Type: application/json' \
             -H "x-api-key: $DOC_CALLBACK_KEY" \
             --data-binary @detail_payload.json)
