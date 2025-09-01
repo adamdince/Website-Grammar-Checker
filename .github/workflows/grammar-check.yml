@@ -1,4 +1,4 @@
-name: Website Grammar Check (GPT, parallel + robust callback)
+name: Website Grammar Check (GPT, parallel + resolved callback)
 
 on:
   repository_dispatch:
@@ -86,7 +86,7 @@ jobs:
           export OPENAI_API_KEY PRIMARY_MODEL FALLBACK_MODEL
           mkdir -p reports
 
-          # Process up to 2 chunks at once (tweak -P 2 to increase/decrease)
+          # Process up to 2 chunks at once (tweak -P 2 for more)
           ls chunks | sort | xargs -I{} -P 2 bash -lc '
             set -euo pipefail
             f="{}"; fp="chunks/$f"; out="out_${f}.json"; rep="reports/$f.json"
@@ -186,24 +186,43 @@ jobs:
             });
             core.info(`Created issue #${issue.number}`);
 
-      - name: Post ALL findings to Google Doc (optional)
+      - name: Resolve Apps Script Web App redirect (for POST)
         env:
-          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}   # Apps Script Web App /exec URL
-          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}   # Must match IMPORT_API_KEY in Apps Script
+          DOC_CALLBACK_URL: ${{ secrets.DOC_CALLBACK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOC_CALLBACK_URL:-}" ]; then
+            echo "::notice::No DOC_CALLBACK_URL configured; skipping resolve"
+            exit 0
+          fi
+          # Must be a Script Web App URL, not a Google Doc
+          if echo "${DOC_CALLBACK_URL}" | grep -qi 'docs.google.com'; then
+            echo "::error::DOC_CALLBACK_URL points to a Google Doc. Use the Web App /exec URL from Apps Script deployments."
+            exit 1
+          fi
+          # Resolve to final signed googleusercontent URL (if any)
+          LOC=$(curl -sS -I "$DOC_CALLBACK_URL" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1 || true)
+          if [ -n "$LOC" ]; then
+            echo "CB_URL=$LOC" >> $GITHUB_ENV
+            echo "Resolved callback URL: $LOC"
+          else
+            echo "CB_URL=$DOC_CALLBACK_URL" >> $GITHUB_ENV
+            echo "Using original callback URL (no redirect exposed)."
+          fi
+
+      - name: Post ALL findings to Google Doc (resolved URL)
+        env:
+          CB_URL: ${{ env.CB_URL }}
+          DOC_CALLBACK_KEY: ${{ secrets.DOC_CALLBACK_KEY }}
           SRC_URL:   ${{ env.SRC_URL }}
           CLIENT_ID: ${{ env.CLIENT_ID }}
           COUNT:     ${{ env.COUNT }}
         run: |
           set -euo pipefail
-          if [ -z "${DOC_CALLBACK_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
+          if [ -z "${CB_URL:-}" ] || [ -z "${DOC_CALLBACK_KEY:-}" ]; then
             echo "Doc callback secrets not set; skipping."
             exit 0
           fi
-          HOST=$(printf '%s\n' "$DOC_CALLBACK_URL" | sed -E 's#^[a-z]+://([^/]+)/.*#\1#')
-          case "$HOST" in
-            script.google.com|script.googleusercontent.com) ;;
-            *) echo "::error::DOC_CALLBACK_URL host is $HOST. Use your Apps Script Web App /exec URL."; exit 1 ;;
-          esac
 
           # Build compact ALL-matches payload
           jq '[ .[] | {
@@ -219,11 +238,10 @@ jobs:
                 '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
               > detail_payload.json
 
-          # Follow redirect AND keep POST; add api_key with ? or & automatically
-          SEP='?'; case "$DOC_CALLBACK_URL" in *\?*) SEP='&';; esac
-          HTTP=$(curl -sS -L --post301 --post302 --post303 \
-            -o /tmp/doc_cb_detail.out -w "%{http_code}" \
-            -X POST "$DOC_CALLBACK_URL${SEP}api_key=$DOC_CALLBACK_KEY" \
+          # POST directly to final URL; preserve POST (no -L). Add api_key with ? or & automatically.
+          SEP='?'; case "$CB_URL" in *\?*) SEP='&';; esac
+          HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
+            -X POST "$CB_URL${SEP}api_key=$DOC_CALLBACK_KEY" \
             -H 'Content-Type: application/json' \
             -H "x-api-key: $DOC_CALLBACK_KEY" \
             --data-binary @detail_payload.json)
