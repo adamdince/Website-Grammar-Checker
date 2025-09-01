@@ -248,7 +248,7 @@ jobs:
                 '{url:$url, client_id:$client_id, audit_type:$audit_type, total_suggestions:$total, matches:$matches[0]}' \
               > detail_payload.json
 
-          # POST directly to final URL; if we get 302, extract redirect and retry
+          # POST directly to final URL; if we get 302, try different approaches
           SEP='?'; case "$CB_URL" in *\?*) SEP='&';; esac
           HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
             -X POST "$CB_URL${SEP}api_key=$DOC_CALLBACK_KEY" \
@@ -256,19 +256,22 @@ jobs:
             -H "x-api-key: $DOC_CALLBACK_KEY" \
             --data-binary @detail_payload.json)
 
-          # If we get a 302, extract the redirect URL and try again
+          # If we get a 302, try posting without additional parameters
           if [ "$HTTP" -eq 302 ]; then
-            echo "Got 302 redirect, extracting redirect URL..."
-            REDIRECT_URL=$(grep -o 'https://script\.googleusercontent\.com[^"]*' /tmp/doc_cb_detail.out | head -1 || true)
-            if [ -n "$REDIRECT_URL" ]; then
-              echo "Retrying with redirect URL: $REDIRECT_URL"
-              # Decode HTML entities
-              REDIRECT_URL=$(echo "$REDIRECT_URL" | sed 's/&amp;/\&/g')
+            echo "Got 302 redirect, trying POST without api_key parameter..."
+            HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
+              -X POST "$CB_URL" \
+              -H 'Content-Type: application/json' \
+              -H "x-api-key: $DOC_CALLBACK_KEY" \
+              --data-binary @detail_payload.json)
+            
+            # If still 302, try with different content type
+            if [ "$HTTP" -eq 302 ]; then
+              echo "Still got 302, trying with form data..."
               HTTP=$(curl -sS -o /tmp/doc_cb_detail.out -w "%{http_code}" \
-                -X POST "$REDIRECT_URL" \
-                -H 'Content-Type: application/json' \
+                -X POST "$CB_URL" \
                 -H "x-api-key: $DOC_CALLBACK_KEY" \
-                --data-binary @detail_payload.json)
+                -d "payload=$(cat detail_payload.json)")
             fi
           fi
 
